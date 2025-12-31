@@ -327,12 +327,6 @@ class DensityControllerTamingGS(DensityControllerOfficial):
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
         
-        # Debug: Check score for multinomial
-        if torch.isnan(score).any() or torch.isinf(score).any():
-            print(f"[Debug] score contains NaN or Inf! NaN count: {torch.isnan(score).sum()}, Inf count: {torch.isinf(score).sum()}")
-        if score.sum() == 0:
-            print("[Debug] score sum is zero! Cannot sample.")
-        
         densify_index = torch.multinomial(score, budget, replacement=False)
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]

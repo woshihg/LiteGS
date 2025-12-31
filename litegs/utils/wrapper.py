@@ -447,7 +447,7 @@ class GaussiansRasterFunc(torch.autograd.Function):
         enable_depth:bool=False
     ):
    
-        img,transmitance,depth,lst_contributor,packed_params,fragment_count,fragment_weight=litegs_fused.rasterize_forward_with_feature(sorted_pointId,tile_start_index,
+        img,transmitance,depth,lst_contributor,packed_params,fragment_count,fragment_weight=litegs_fused.rasterize_forward(sorted_pointId,tile_start_index,
                                                                                             ndc,cov2d_inv,color,opacities,
                                                                                             tiles,img_h,img_w,tile_h,tile_w,
                                                                                             StatisticsHelperInst.bStart,
@@ -554,12 +554,6 @@ class GaussiansRasterFuncClassification(torch.autograd.Function):
         (img_h,img_w)=ctx.img_hw
         tile_h,tile_w=ctx.arg_tile_size
 
-        # Debug: Check input gradients
-        if torch.isnan(grad_rgb_image).any() or torch.isinf(grad_rgb_image).any():
-            print("[Debug] grad_rgb_image contains NaN or Inf!")
-        if torch.isnan(grad_category_image).any() or torch.isinf(grad_category_image).any():
-            print("[Debug] grad_category_image contains NaN or Inf!")
-
         grad_rgb_image_max=grad_rgb_image.abs().max()
         grad_category_image_max=grad_category_image.abs().max()
         combined_max = torch.max(grad_rgb_image_max, grad_category_image_max).clamp_min(1e-6)
@@ -572,15 +566,6 @@ class GaussiansRasterFuncClassification(torch.autograd.Function):
                                                                                           grad_rgb_image,grad_category_image,grad_transmitance_image,grad_depth_image,combined_max,
                                                                                           img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart)
         
-        # Debug: Check output gradients from CUDA
-        if torch.isnan(grad_classification).any() or torch.isinf(grad_classification).any():
-            print(f"[Debug] grad_classification contains NaN or Inf! Max: {grad_classification.abs().max()}")
-        if torch.isnan(grad_opacities).any() or torch.isinf(grad_opacities).any():
-            print(f"[Debug] grad_opacities contains NaN or Inf! Max: {grad_opacities.abs().max()}")
-        
-        if StatisticsHelperInst.bStart and grad_o_square.sum() == 0:
-            print("[Debug] grad_o_square is all zeros! Statistics will be zero.")
-
         if StatisticsHelperInst.bStart:
             StatisticsHelperInst.update_mean_std("fragment_weight",fragment_weight,fragment_weight*fragment_weight,fragment_count,None)
             StatisticsHelperInst.update_mean_std("fragment_err",grad_opacities.unsqueeze(0),grad_o_square*combined_max*combined_max,fragment_count,None)

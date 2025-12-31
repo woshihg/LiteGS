@@ -191,9 +191,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 if gt_mask is not None:
                     if isinstance(gt_mask, (list, tuple)):
                         if gt_mask[0] is not None:
-                            gt_mask = gt_mask.cuda().float() / 255.0
+                            gt_mask = gt_mask.cuda().long()
                     else:
-                        gt_mask = gt_mask.cuda().float() / 255.0
+                        gt_mask = gt_mask.cuda().long()
                         
                 if op.learnable_viewproj:
                     #fix view matrix
@@ -215,8 +215,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loss+=(1-transmitance).abs().mean()
                 
                 if class_feature is not None and gt_mask is not None:
-                    loss += torch.nn.functional.mse_loss(class_feature, gt_mask)
-
+                    # gt_mask stores category indices [B, 1, H, W], class_feature stores one-hot [B, 16, H, W]
+                    gt_one_hot = torch.nn.functional.one_hot(gt_mask.squeeze(1).long(), num_classes=class_feature.shape[1])
+                    gt_one_hot = gt_one_hot.permute(0, 3, 1, 2).float()
+                    loss += torch.nn.functional.mse_loss(class_feature, gt_one_hot)
+ 
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -257,7 +260,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             if isinstance(gt_mask, (list, tuple)):
                                 gt_mask = gt_mask[0]
                             if gt_mask is not None:
-                                gt_mask = gt_mask.cuda().float() / 255.0
+                                gt_mask = gt_mask.cuda().long()
                         else:
                             # Handle missing gt_mask by creating a default mask
                             gt_mask = torch.ones_like(gt_image[:, 0:1, :, :], device='cuda')
