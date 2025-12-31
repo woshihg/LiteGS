@@ -20,6 +20,7 @@ from .. import render
 from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
+from torch.utils.tensorboard import SummaryWriter
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
@@ -168,6 +169,9 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         dp.densify_until=int(total_epoch*0.8/dp.opacity_reset_interval)*dp.opacity_reset_interval+1
     density_controller=densify.DensityControllerTamingGS(norm_radius,dp,pp.cluster_size>0,init_points_num)
     StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
+    
+    writer = SummaryWriter(log_dir=lp.model_path)
+    
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
 
@@ -181,7 +185,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
 
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,idx,gt_mask in train_loader:
+            for i, (view_matrix,proj_matrix,frustumplane,gt_image,idx,gt_mask) in enumerate(train_loader):
+                global_step = epoch * len(train_loader) + i
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
@@ -214,13 +219,25 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 if pp.enable_transmitance:
                     loss+=(1-transmitance).abs().mean()
                 
+                class_loss = 0
                 if class_feature is not None and gt_mask is not None:
                     # gt_mask stores category indices [B, 1, H, W], class_feature stores one-hot [B, 16, H, W]
                     gt_one_hot = torch.nn.functional.one_hot(gt_mask.squeeze(1).long(), num_classes=class_feature.shape[1])
                     gt_one_hot = gt_one_hot.permute(0, 3, 1, 2).float()
-                    loss += torch.nn.functional.mse_loss(class_feature, gt_one_hot)
+                    class_loss = torch.nn.functional.mse_loss(class_feature, gt_one_hot)
+                    loss += class_loss
  
                 loss.backward()
+                
+                # TensorBoard logging
+                if global_step % 10 == 0:
+                    writer.add_scalar('train/total_loss', loss.item(), global_step)
+                    writer.add_scalar('train/l1_loss', l1_loss.item(), global_step)
+                    writer.add_scalar('train/ssim_loss', ssim_loss.item(), global_step)
+                    if class_feature is not None:
+                        writer.add_scalar('train/class_loss', class_loss.item() if isinstance(class_loss, torch.Tensor) else class_loss, global_step)
+                    writer.add_scalar('train/num_points', xyz.shape[-1] * (xyz.shape[-2] if pp.cluster_size else 1), global_step)
+
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
                 if pp.sparse_grad:
@@ -327,4 +344,5 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         if epoch in save_checkpoint:
             io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)
     
+    writer.close()
     return
