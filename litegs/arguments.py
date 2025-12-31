@@ -89,6 +89,7 @@ class OptimizationParams(ParamGroup):
     rotation_lr = 0.001
     lambda_dssim = 0.2
     reg_weight = 0.0
+    classification_iter = 10
     learnable_viewproj = False
     def __init__(self, parser):
         super().__init__(parser, "Optimization Parameters")

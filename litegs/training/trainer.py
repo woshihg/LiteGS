@@ -209,8 +209,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 #cluster culling
                 visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_features=render.render_preprocess(
                     cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree,features)
+                
+                # Conditionally render classification features
+                do_classification = (culled_features is not None) and (global_step % op.classification_iter == 0)
+                render_features = culled_features if do_classification else None
+
                 img,transmitance,depth,normal,primitive_visible,class_feature=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                            actived_sh_degree,gt_image.shape[2:],pp,culled_features)
+                                                            actived_sh_degree,gt_image.shape[2:],pp,render_features)
                 
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
@@ -220,7 +225,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loss+=(1-transmitance).abs().mean()
                 
                 class_loss = 0
-                if class_feature is not None and gt_mask is not None:
+                if do_classification and class_feature is not None and gt_mask is not None:
                     # gt_mask stores category indices [B, 1, H, W], class_feature stores one-hot [B, 16, H, W]
                     gt_one_hot = torch.nn.functional.one_hot(gt_mask.squeeze(1).long(), num_classes=class_feature.shape[1])
                     gt_one_hot = gt_one_hot.permute(0, 3, 1, 2).float()
@@ -338,6 +343,21 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             for tensor in tensors:
                 param_nyp.append(tensor.detach().cpu().numpy())
             io_manager.save_ply(os.path.join(save_path,"point_cloud.ply"),*param_nyp)
+
+            # Save separate PLY files for each category if features exist
+            if features is not None and features.shape[0] > 0:
+                # features is the last element in tensors
+                feat_tensor = tensors[-1]
+                categories = torch.argmax(feat_tensor, dim=0)
+                unique_cats = torch.unique(categories)
+                print(f"Saving {len(unique_cats)} categories to separate PLY files...")
+                for cat in unique_cats:
+                    mask = (categories == cat)
+                    cat_tensors = [t[..., mask] for t in tensors]
+                    param_nyp_cat = [t.detach().cpu().numpy() for t in cat_tensors]
+                    cat_save_path = os.path.join(save_path, f"point_cloud_cat_{cat.item()}.ply")
+                    io_manager.save_ply(cat_save_path, *param_nyp_cat)
+
             if op.learnable_viewproj:
                 torch.save(list(denoised_training_extr.parameters())+[denoised_training_intr],os.path.join(save_path,"viewproj.pth"))
 
