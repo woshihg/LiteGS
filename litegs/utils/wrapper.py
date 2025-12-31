@@ -447,7 +447,7 @@ class GaussiansRasterFunc(torch.autograd.Function):
         enable_depth:bool=False
     ):
    
-        img,transmitance,depth,lst_contributor,packed_params,fragment_count,fragment_weight=litegs_fused.rasterize_forward(sorted_pointId,tile_start_index,
+        img,transmitance,depth,lst_contributor,packed_params,fragment_count,fragment_weight=litegs_fused.rasterize_forward_with_feature(sorted_pointId,tile_start_index,
                                                                                             ndc,cov2d_inv,color,opacities,
                                                                                             tiles,img_h,img_w,tile_h,tile_w,
                                                                                             StatisticsHelperInst.bStart,
@@ -509,6 +509,100 @@ class GaussiansRasterFunc(torch.autograd.Function):
         )
 
         return grads
+    
+    
+class GaussiansRasterFuncClassification(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        sorted_pointId:torch.Tensor,
+        tile_start_index:torch.Tensor,
+        ndc:torch.Tensor,
+        cov2d_inv:torch.Tensor,
+        color:torch.Tensor,
+        opacities:torch.Tensor,
+        classification:torch.Tensor,
+        tiles:torch.Tensor,
+        img_h:int,
+        img_w:int,
+        tile_h:int,
+        tile_w:int,
+        enable_transmitance:bool=False,
+        enable_depth:bool=False
+    ):
+   
+        img,category_img,transmitance,depth,lst_contributor,packed_params,fragment_count,fragment_weight=litegs_fused.rasterize_forward_classification(sorted_pointId,tile_start_index,
+                                                                                            ndc,cov2d_inv,color,opacities,classification,
+                                                                                            tiles,img_h,img_w,tile_h,tile_w,
+                                                                                            StatisticsHelperInst.bStart,
+                                                                                            enable_transmitance,enable_depth)
+
+        ctx.save_for_backward(sorted_pointId,tile_start_index,transmitance,lst_contributor,packed_params,tiles,fragment_count,fragment_weight)
+        ctx.arg_tile_size=(tile_h,tile_w)
+        ctx.img_hw=(img_h,img_w)
+
+        if enable_depth==False:
+            depth=None
+        if enable_transmitance==False:
+            transmitance=None
+        normal=None
+        return img,category_img,transmitance,depth,normal,lst_contributor
+
+    @staticmethod
+    def backward(ctx, grad_rgb_image:torch.Tensor, grad_category_image:torch.Tensor, grad_transmitance_image:torch.Tensor,grad_depth_image:torch.Tensor,grad_normal_image:torch.Tensor,_:torch.Tensor):
+        sorted_pointId,tile_start_index,transmitance,lst_contributor,packed_params,tiles,fragment_count,fragment_weight=ctx.saved_tensors
+        (img_h,img_w)=ctx.img_hw
+        tile_h,tile_w=ctx.arg_tile_size
+
+        # Debug: Check input gradients
+        if torch.isnan(grad_rgb_image).any() or torch.isinf(grad_rgb_image).any():
+            print("[Debug] grad_rgb_image contains NaN or Inf!")
+        if torch.isnan(grad_category_image).any() or torch.isinf(grad_category_image).any():
+            print("[Debug] grad_category_image contains NaN or Inf!")
+
+        grad_rgb_image_max=grad_rgb_image.abs().max()
+        grad_category_image_max=grad_category_image.abs().max()
+        combined_max = torch.max(grad_rgb_image_max, grad_category_image_max).clamp_min(1e-6)
+
+        grad_rgb_image=grad_rgb_image/combined_max
+        grad_category_image=grad_category_image/combined_max
+
+        grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,grad_classification,_,grad_o_square=litegs_fused.rasterize_backward_classification(sorted_pointId,tile_start_index,packed_params,tiles,
+                                                                                          transmitance,lst_contributor,
+                                                                                          grad_rgb_image,grad_category_image,grad_transmitance_image,grad_depth_image,combined_max,
+                                                                                          img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart)
+        
+        # Debug: Check output gradients from CUDA
+        if torch.isnan(grad_classification).any() or torch.isinf(grad_classification).any():
+            print(f"[Debug] grad_classification contains NaN or Inf! Max: {grad_classification.abs().max()}")
+        if torch.isnan(grad_opacities).any() or torch.isinf(grad_opacities).any():
+            print(f"[Debug] grad_opacities contains NaN or Inf! Max: {grad_opacities.abs().max()}")
+        
+        if StatisticsHelperInst.bStart and grad_o_square.sum() == 0:
+            print("[Debug] grad_o_square is all zeros! Statistics will be zero.")
+
+        if StatisticsHelperInst.bStart:
+            StatisticsHelperInst.update_mean_std("fragment_weight",fragment_weight,fragment_weight*fragment_weight,fragment_count,None)
+            StatisticsHelperInst.update_mean_std("fragment_err",grad_opacities.unsqueeze(0),grad_o_square*combined_max*combined_max,fragment_count,None)
+
+        grads = (
+            None,
+            None,
+            grad_ndc,
+            grad_cov2d_inv,
+            grad_color,
+            grad_opacities,
+            grad_classification,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+
+        return grads  
 
 class SphericalHarmonicToRGB(BaseWrapper):
     """
@@ -791,10 +885,45 @@ class CullCompactActivateWithSparseGrad(torch.autograd.Function):
         grads=[]#the index of sprase tensor is invalid!! backward compact with Our Optimizer
         for grad in compactd_grads:
             sparse_value=grad.reshape(-1,chunk_size)
-            placeholder_grad=torch.sparse_coo_tensor(torch.empty(grad.dim()-1,sparse_value.shape[0],device='cuda'),sparse_value,(*grad.shape[:-2],chunk_num,chunk_size))
+            # placeholder_grad=torch.sparse_coo_tensor(torch.empty(grad.dim()-1,sparse_value.shape[0],device='cuda'),sparse_value,(*grad.shape[:-2],chunk_num,chunk_size))
+            
+            indices = torch.zeros((grad.dim() - 1, sparse_value.shape[0]), device='cuda', dtype=torch.long)
+            placeholder_grad=torch.sparse_coo_tensor(indices,sparse_value,(*grad.shape[:-2],chunk_num,chunk_size))
             # placeholder_grad=torch.concat((grad, torch.empty((*grad.shape[:-2], chunk_num-grad.shape[-2], chunk_size),device='cuda')), dim=-2)
             grads.append(placeholder_grad)
         return None,None,None,None,None,*grads
+
+class CullCompactActivateWithSparseGradClassification(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,cluster_origin,cluster_extend,frustumplane,view_matrix,sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity,classification)->tuple[torch.Tensor,...]:
+        ctx.chunk_num=xyz.shape[-2]
+        ctx.chunk_size=xyz.shape[-1]
+        ctx.sh_degree=sh_degree
+        
+        visible_chunkid, activated_position,activated_scale,activated_rotation,color,activated_opacity,activated_classification=litegs_fused.cull_compact_activate_classification(cluster_origin,cluster_extend,frustumplane,view_matrix,sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity,classification)
+
+        ctx.save_for_backward(visible_chunkid,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,classification)
+
+        return visible_chunkid, activated_position,activated_scale,activated_rotation,color,activated_opacity,activated_classification
+    
+    @staticmethod
+    def backward(ctx,_,activated_position_grad,activated_scale_grad,activated_rotation_grad,color_grad,activated_opacity_grad,activated_classification_grad):
+        chunk_num=ctx.chunk_num
+        chunk_size=ctx.chunk_size
+        sh_degree=ctx.sh_degree
+        visible_chunkid,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,classification=ctx.saved_tensors
+        compactd_grads=litegs_fused.activate_backward_classification(
+            visible_chunkid,view_matrix,sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity,classification,
+            activated_position_grad,activated_scale_grad,activated_rotation_grad,color_grad,activated_opacity_grad,activated_classification_grad)
+        grads=[]#the index of sprase tensor is invalid!! backward compact with Our Optimizer
+        for grad in compactd_grads:
+            sparse_value=grad.reshape(-1,chunk_size)
+            
+            indices = torch.zeros((grad.dim() - 1, sparse_value.shape[0]), device='cuda', dtype=torch.long)
+            placeholder_grad=torch.sparse_coo_tensor(indices,sparse_value,(*grad.shape[:-2],chunk_num,chunk_size))
+            grads.append(placeholder_grad)
+        return None,None,None,None,None,*grads
+
 
 def sparse_adam_update(param:torch.Tensor, grad:torch.Tensor, exp_avg:torch.Tensor, exp_avg_sq:torch.Tensor, visible_chunk:torch.Tensor, 
                        lr:float, b1:float, b2:float, eps:float):

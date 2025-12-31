@@ -10,29 +10,45 @@ from .. import scene
 
 def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tensor|None,frustumplane:torch.Tensor,view_matrix:torch.Tensor,
                       xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,sh_0:torch.Tensor,sh_rest:torch.Tensor,opacity:torch.Tensor,
-                      op:arguments.OptimizationParams,pp:arguments.PipelineParams,actived_sh_degree:int):
+                      op:arguments.OptimizationParams,pp:arguments.PipelineParams,actived_sh_degree:int,
+                      features:torch.Tensor=None):
 
     if pp.cluster_size:
+        # 聚类边界初始化 如果未提供聚类边界，则根据高斯球的位置、尺度和旋转计算聚类的 AABB
         if cluster_origin is None or cluster_extend is None:
             cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
 
-        if pp.sparse_grad:#enable sparse gradient
-            visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity=utils.wrapper.CullCompactActivateWithSparseGrad.apply(
+        if pp.sparse_grad:#enable sparse gradient        
+            if features is not None:
+                visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_features=utils.wrapper.CullCompactActivateWithSparseGradClassification.apply(
+                cluster_origin,cluster_extend,frustumplane,view_matrix,actived_sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity,features)
+                # 将裁剪后的高斯球从聚类表示中解聚类，恢复为独立的点。
+                culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_features=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_features)
+            else:
+                # 使用稀疏梯度模式对高斯球进行裁剪和筛选。 返回可见的高斯球及其属性。
+                visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity=utils.wrapper.CullCompactActivateWithSparseGrad.apply(
                 cluster_origin,cluster_extend,frustumplane,view_matrix,actived_sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity)
-            culled_xyz,culled_scale,culled_rot,color,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,color,culled_opacity)  
+                # 将裁剪后的高斯球从聚类表示中解聚类，恢复为独立的点。
+                culled_xyz,culled_scale,culled_rot,color,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,color,culled_opacity) 
+                culled_features=None 
             if StatisticsHelperInst.bStart:
                 StatisticsHelperInst.set_compact_mask(visible_chunkid)
-            return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
+            return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_features
         else:
             visibility,visible_num,visible_chunkid=utils.wrapper.litegs_fused.frustum_culling_aabb_cuda(cluster_origin,cluster_extend,frustumplane)
             visible_chunkid=visible_chunkid[:visible_num]
-            culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=scene.cluster.culling(visible_chunkid,xyz,scale,rot,sh_0,sh_rest,opacity)
-            culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity)
+            if features is not None:
+                culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,culled_features=scene.cluster.culling(visible_chunkid,xyz,scale,rot,sh_0,sh_rest,opacity,features)
+                culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,culled_features=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,culled_features)
+            else:
+                culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=scene.cluster.culling(visible_chunkid,xyz,scale,rot,sh_0,sh_rest,opacity)
+                culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=scene.cluster.uncluster(culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity)
+                culled_features=None
 
         if StatisticsHelperInst.bStart:
             StatisticsHelperInst.set_compact_mask(visible_chunkid)
     else:
-        culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity=xyz,scale,rot,sh_0,sh_rest,opacity
+        culled_xyz,culled_scale,culled_rot,culled_sh_0,culled_sh_rest,culled_opacity,culled_features=xyz,scale,rot,sh_0,sh_rest,opacity,features
         visible_chunkid=None
 
     nvtx.range_push("Activate")
@@ -47,12 +63,12 @@ def render_preprocess(cluster_origin:torch.Tensor|None,cluster_extend:torch.Tens
         dirs=torch.nn.functional.normalize(dirs,dim=-2)
     color=utils.wrapper.SphericalHarmonicToRGB.call_fused(actived_sh_degree,culled_sh_0,culled_sh_rest,dirs)
     nvtx.range_pop()
-
-    return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity
+    return visible_chunkid,culled_xyz,culled_scale,culled_rot,color,culled_opacity,culled_features
 
 def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
            xyz:torch.Tensor,scale:torch.Tensor,rot:torch.Tensor,color:torch.Tensor,opacity:torch.Tensor,
-           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor]:
+           actived_sh_degree:int,output_shape:tuple[int,int],pp:arguments.PipelineParams,
+           features:torch.Tensor=None)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor|None]:
 
     #gs projection
     nvtx.range_push("Proj")
@@ -61,7 +77,14 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
     cov2d=utils.wrapper.CreateCov2dDirectly.call_fused(J,view_matrix,transform_matrix)
     eigen_val,eigen_vec,inv_cov2d=utils.wrapper.EighAndInverse2x2Matrix.call_fused(cov2d)
     #ndc_pos=utils.wrapper.World2NdcFunc.apply(xyz,view_matrix@proj_matrix)
-    hom_pos=(xyz.transpose(0,1)@(view_matrix@proj_matrix)).transpose(1,2).contiguous()
+
+    # hom_pos=(xyz.transpose(0,1)@(view_matrix@proj_matrix)).transpose(1,2).contiguous()
+    
+    hom_pos = view_matrix@proj_matrix
+    hom_pos = xyz.transpose(0,1) @ hom_pos
+    hom_pos = hom_pos.transpose(1,2)
+    hom_pos = hom_pos.contiguous()
+
     ndc_pos=hom_pos/(hom_pos[:,3:4,:]+1e-7)
 
     view_depth=(view_matrix.transpose(1,2)@xyz)[:,2]
@@ -78,9 +101,23 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
         tiles=StatisticsHelperInst.cached_sorted_tile_list[StatisticsHelperInst.cur_sample].unsqueeze(0)
     except:
         pass
-    img,transmitance,depth,normal,lst_contributor=utils.wrapper.GaussiansRasterFunc.apply(sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,tiles,
+
+    class_feature=None
+    if features is not None:
+        # 将 features 扩展到与视图数量相同的维度
+        V = view_matrix.shape[0]
+        if features.dim() == 2:
+            features = features.unsqueeze(0).expand(V, -1, -1).contiguous()
+        elif features.dim() == 3 and features.shape[0] == 1 and V > 1:
+            features = features.expand(V, -1, -1).contiguous()
+
+        img,class_feature,transmitance,depth,normal,lst_contributor=utils.wrapper.GaussiansRasterFuncClassification.apply(
+            sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,features,tiles,
+            output_shape[0],output_shape[1],pp.tile_size[0],pp.tile_size[1],pp.enable_transmitance,pp.enable_depth)
+    else:
+        img,transmitance,depth,normal,lst_contributor=utils.wrapper.GaussiansRasterFunc.apply(sorted_pointId,tile_start_index,ndc_pos,inv_cov2d,color,opacity,tiles,
                                             output_shape[0],output_shape[1],pp.tile_size[0],pp.tile_size[1],pp.enable_transmitance,pp.enable_depth)
-    
+
     if StatisticsHelperInst.bStart:
         StatisticsHelperInst.update_tile_blend_count(lst_contributor)
 
@@ -92,4 +129,6 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
         depth=utils.tiles2img_torch(depth,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
     if normal is not None:
         normal=utils.tiles2img_torch(normal,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
-    return img,transmitance,depth,normal,primitive_visible
+    if class_feature is not None:
+        class_feature=utils.tiles2img_torch(class_feature,tiles_x,tiles_y)[...,:output_shape[0],:output_shape[1]].contiguous()
+    return img,transmitance,depth,normal,primitive_visible,class_feature

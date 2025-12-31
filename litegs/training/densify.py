@@ -18,19 +18,13 @@ class DensityControllerBase:
         return
     
     @torch.no_grad()
-    def _get_params_from_optimizer(self,optimizer:torch.optim.Optimizer)->list[torch.Tensor]:
+    def _get_params_from_optimizer(self,optimizer:torch.optim.Optimizer)->dict[str,torch.Tensor]:
         param_dict:dict[str,torch.Tensor]={}
         for param_group in optimizer.param_groups:
             name=param_group['name']
             tensor=param_group['params'][0]
             param_dict[name]=tensor
-        xyz=param_dict["xyz"]
-        rot=param_dict["rot"]
-        scale=param_dict["scale"]
-        sh_0=param_dict["sh_0"]
-        sh_rest=param_dict["sh_rest"]
-        opacity=param_dict["opacity"]
-        return xyz,scale,rot,sh_0,sh_rest,opacity
+        return param_dict
 
     @torch.no_grad()
     def _cat_tensors_to_optimizer(self, tensors_dict:dict,optimizer:torch.optim.Optimizer):
@@ -137,7 +131,14 @@ class DensityControllerOfficial(DensityControllerBase):
     @torch.no_grad()
     def prune(self,optimizer:torch.optim.Optimizer,epoch:int):
         
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+        param_dict=self._get_params_from_optimizer(optimizer)
+        xyz=param_dict["xyz"]
+        rot=param_dict["rot"]
+        scale=param_dict["scale"]
+        sh_0=param_dict["sh_0"]
+        sh_rest=param_dict["sh_rest"]
+        opacity=param_dict["opacity"]
+
         if self.bCluster:
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
@@ -159,7 +160,15 @@ class DensityControllerOfficial(DensityControllerBase):
     @torch.no_grad()
     def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
         
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+        params=self._get_params_from_optimizer(optimizer)
+        xyz=params["xyz"]
+        scale=params["scale"]
+        rot=params["rot"]
+        sh_0=params["sh_0"]
+        sh_rest=params["sh_rest"]
+        opacity=params["opacity"]
+        features=params.get("features",None)
+
         if self.bCluster:
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
@@ -222,7 +231,8 @@ class DensityControllerOfficial(DensityControllerBase):
     
     @torch.no_grad()
     def reset_opacity(self,optimizer:torch.optim.Optimizer,epoch:int):
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+        params=self._get_params_from_optimizer(optimizer)
+        opacity=params["opacity"]
         def inverse_sigmoid(x):
             return torch.log(x/(1-x))
         actived_opacities=opacity.sigmoid()
@@ -254,7 +264,8 @@ class DensityControllerOfficial(DensityControllerBase):
                 self.reset_opacity(optimizer,epoch)
                 bUpdate=True
             if bUpdate:
-                xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+                params=self._get_params_from_optimizer(optimizer)
+                xyz=params["xyz"]
                 StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],self.is_densify_actived)
                 torch.cuda.empty_cache()
         return self._get_params_from_optimizer(optimizer)
@@ -294,10 +305,20 @@ class DensityControllerTamingGS(DensityControllerOfficial):
     @torch.no_grad()
     def split_and_clone(self,optimizer:torch.optim.Optimizer,epoch:int):
         
-        xyz,scale,rot,sh_0,sh_rest,opacity=self._get_params_from_optimizer(optimizer)
+        params=self._get_params_from_optimizer(optimizer)
+        xyz=params["xyz"]
+        scale=params["scale"]
+        rot=params["rot"]
+        sh_0=params["sh_0"]
+        sh_rest=params["sh_rest"]
+        opacity=params["opacity"]
+        features = params.get("features", None)
         if self.bCluster:
             chunk_size=xyz.shape[-1]
-            xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+            if features is not None:
+                xyz,scale,rot,sh_0,sh_rest,opacity,features=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity,features)
+            else:
+                xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
         prune_num=self.get_prune_mask(opacity.sigmoid(),scale.exp()).sum()
 
@@ -305,6 +326,13 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
+        
+        # Debug: Check score for multinomial
+        if torch.isnan(score).any() or torch.isinf(score).any():
+            print(f"[Debug] score contains NaN or Inf! NaN count: {torch.isnan(score).sum()}, Inf count: {torch.isinf(score).sum()}")
+        if score.sum() == 0:
+            print("[Debug] score sum is zero! Cannot sample.")
+        
         densify_index = torch.multinomial(score, budget, replacement=False)
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]
@@ -342,14 +370,27 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         clone_opacity=opacity[...,clone_index]
         append_opacity = torch.cat((split_opacity,clone_opacity),dim=-1)
 
+        append_features = None
+        if features is not None:
+            split_features = features[...,split_index]
+            clone_features = features[...,clone_index]
+            append_features = torch.cat((split_features,clone_features),dim=-1)
+
         if self.bCluster:
             N=append_xyz.shape[-1]
             chunk_num=int(N/chunk_size)
             append_limit=chunk_num*chunk_size
-            append_xyz,append_scale,append_rot,append_sh_0,append_sh_rest,append_opacity=cluster.cluster_points(
-                chunk_size,append_xyz[...,:append_limit],append_scale[...,:append_limit],
-                append_rot[...,:append_limit],append_sh_0[...,:append_limit],
-                append_sh_rest[...,:append_limit],append_opacity[...,:append_limit])
+            if append_features is not None:
+                append_xyz,append_scale,append_rot,append_sh_0,append_sh_rest,append_opacity,append_features=cluster.cluster_points(
+                    chunk_size,append_xyz[...,:append_limit],append_scale[...,:append_limit],
+                    append_rot[...,:append_limit],append_sh_0[...,:append_limit],
+                    append_sh_rest[...,:append_limit],append_opacity[...,:append_limit],
+                    append_features[...,:append_limit])
+            else:
+                append_xyz,append_scale,append_rot,append_sh_0,append_sh_rest,append_opacity=cluster.cluster_points(
+                    chunk_size,append_xyz[...,:append_limit],append_scale[...,:append_limit],
+                    append_rot[...,:append_limit],append_sh_0[...,:append_limit],
+                    append_sh_rest[...,:append_limit],append_opacity[...,:append_limit])
 
         dict_clone = {"xyz": append_xyz,
                       "scale": append_scale,
@@ -357,6 +398,8 @@ class DensityControllerTamingGS(DensityControllerOfficial):
                       "sh_0": append_sh_0,
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
+        if append_features is not None:
+            dict_clone["features"] = append_features
         
         #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_index.sum().cpu(),split_index.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
         self._cat_tensors_to_optimizer(dict_clone,optimizer)

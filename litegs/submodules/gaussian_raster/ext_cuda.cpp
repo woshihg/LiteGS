@@ -14,7 +14,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("get_allocate_size", &get_allocate_size);
 	m.def("rasterize_forward", &rasterize_forward);
 	m.def("rasterize_forward_packed", &rasterize_forward_packed);
+	m.def("rasterize_forward_classification", &rasterize_forward_classification);
 	m.def("rasterize_backward", &rasterize_backward);
+	m.def("rasterize_backward_classification", &rasterize_backward_classification);
 	m.def("jacobianRayspace", &jacobianRayspace);
 	m.def("createTransformMatrix_forward", &createTransformMatrix_forward);
 	m.def("createTransformMatrix_backward", &createTransformMatrix_backward);
@@ -27,7 +29,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("eigh_and_inv_2x2matrix_forward", &eigh_and_inv_2x2matrix_forward);
 	m.def("inv_2x2matrix_backward", &inv_2x2matrix_backward);
 	m.def("cull_compact_activate", &cull_compact_activate);
+	m.def("cull_compact_activate_classification", &cull_compact_activate_classification);
 	m.def("activate_backward", &activate_backward);
+	m.def("activate_backward_classification", &activate_backward_classification);
 	m.def("adamUpdate", &adamUpdate);
 	m.def("frustum_culling_aabb_cuda", &frustum_culling_aabb_cuda);
 }

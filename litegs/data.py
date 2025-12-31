@@ -79,6 +79,7 @@ class ImageFrame:
         self.img_source:str=img_source
         self.xys:npt.NDArray=np.array(xys)
         self.image={}
+        self.mask={}
         return
     
     def load_image(self,downsample:int=-1):
@@ -106,6 +107,34 @@ class ImageFrame:
                 resolution = (int(orig_w / scale), int(orig_h / scale))  
             self.image[downsample]=np.array(image.resize(resolution),dtype=np.uint8).transpose(2,0,1)
         return self.image[downsample]
+
+    def load_mask(self,mask_source:str,downsample:int=-1):
+        if self.mask.get(downsample,None) is None:
+            if not os.path.exists(mask_source):
+                print(f"[ WARN ] Mask file {mask_source} does not exist, using full mask.")
+                return None
+            mask:PIL.Image.Image=PIL.Image.open(mask_source)
+
+            orig_w, orig_h = mask.size
+            if downsample in [1, 2, 4, 8]:
+                resolution = round(orig_w/ downsample), round(orig_h/ downsample)
+            else:  # should be a type that converts to float
+                if downsample == -1:
+                    if orig_w > 1600:
+                        global_down = orig_w / 1600
+                    else:
+                        global_down = 1
+                else:
+                    global_down = orig_w / downsample
+
+                scale = float(global_down)
+                resolution = (int(orig_w / scale), int(orig_h / scale))  
+            self.mask[downsample]=np.array(mask.resize(resolution),dtype=np.uint8)
+            if len(self.mask[downsample].shape)==2:
+                self.mask[downsample]=self.mask[downsample][np.newaxis,...]
+            else:
+                self.mask[downsample]=self.mask[downsample].transpose(2,0,1)
+        return self.mask[downsample]
     
     def get_viewmatrix(self)->npt.NDArray:
         return self.view_matrix
@@ -186,6 +215,8 @@ class CameraFrameDataset(Dataset):
                 frame.view_matrix=torch.Tensor(frame.view_matrix).cuda()
                 for key in frame.image.keys():
                     frame.image[key]=torch.tensor(frame.image[key]).cuda()
+                for key in frame.mask.keys():
+                    frame.mask[key]=torch.tensor(frame.mask[key]).cuda()
             self.idx_array=torch.arange(0,len(frames)).cuda()
         
         #init frustumplanes
@@ -218,15 +249,21 @@ class CameraFrameDataset(Dataset):
     def __len__(self):
         return len(self.frames)
     
-    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor|None]:
         image=self.frames[idx].load_image(self.downsample)
+        mask=self.frames[idx].mask.get(self.downsample,None)
+        if mask is not None:
+            if not torch.is_tensor(mask):
+                mask=torch.tensor(mask)
+
         view_matrix=self.frames[idx].get_viewmatrix()
         proj_matrix=self.cameras[self.frames[idx].camera_id].get_project_matrix()
         frustumplane=self.frustumplanes[idx]
         StatisticsHelperInst.cur_sample=self.frames[idx].name
         if self.idx_array is not None:
             idx=self.idx_array[idx]
-        return view_matrix,proj_matrix,frustumplane,image,idx
+        
+        return view_matrix,proj_matrix,frustumplane,image,idx,mask
     
     def get_norm(self)->tuple[float,float]:
         def get_center_and_diag(cam_centers):

@@ -62,27 +62,33 @@ if __name__ == "__main__":
             training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
             test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
         trainingset=litegs.data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
-        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=lambda x: x[0])
         testset=litegs.data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
-        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=lambda x: x[0])
     else:
         trainingset=litegs.data.CameraFrameDataset(cameras_info,camera_frames,lp.resolution,pp.device_preload)
-        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=lambda x: x[0])
     norm_trans,norm_radius=trainingset.get_norm()
 
     #model
-    xyz,scale,rot,sh_0,sh_rest,opacity=litegs.io_manager.load_ply(os.path.join(lp.model_path,"point_cloud","finish","point_cloud.ply"),lp.sh_degree)
+    xyz,scale,rot,sh_0,sh_rest,opacity,inferred_sh_degree,features=litegs.io_manager.load_ply(os.path.join(lp.model_path,"point_cloud","finish","point_cloud.ply"),lp.sh_degree)
     xyz=torch.Tensor(xyz).cuda()
     scale=torch.Tensor(scale).cuda()
     rot=torch.Tensor(rot).cuda()
     sh_0=torch.Tensor(sh_0).cuda()
     sh_rest=torch.Tensor(sh_rest).cuda()
     opacity=torch.Tensor(opacity).cuda()
+    if features is not None:
+        features=torch.Tensor(features).cuda()
     cluster_origin=None
     cluster_extend=None
     if pp.cluster_size>0:
-        xyz,scale,rot,sh_0,sh_rest,opacity=litegs.scene.point.spatial_refine(False,None,xyz,scale,rot,sh_0,sh_rest,opacity)
-        xyz,scale,rot,sh_0,sh_rest,opacity=litegs.scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
+        if features is not None:
+            xyz,scale,rot,sh_0,sh_rest,opacity,features=litegs.scene.point.spatial_refine(False,None,xyz,scale,rot,sh_0,sh_rest,opacity,features)
+            xyz,scale,rot,sh_0,sh_rest,opacity,features=litegs.scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity,features)
+        else:
+            xyz,scale,rot,sh_0,sh_rest,opacity=litegs.scene.point.spatial_refine(False,None,xyz,scale,rot,sh_0,sh_rest,opacity)
+            xyz,scale,rot,sh_0,sh_rest,opacity=litegs.scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
         cluster_origin,cluster_extend=litegs.scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
     if op.learnable_viewproj:
         noise_extr=torch.cat([frame.extr_params[None,:] for frame in trainingset.frames])
@@ -123,9 +129,9 @@ if __name__ == "__main__":
                     view_matrix,proj_matrix,viewproj_matrix,frustumplane=litegs.utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
 
                 #cluster culling
-                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=litegs.render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,lp.sh_degree)
-                img,transmitance,depth,normal,primitive_visible=litegs.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                            lp.sh_degree,gt_image.shape[2:],pp)
+                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_features=litegs.render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,lp.sh_degree,features)
+                img,transmitance,depth,normal,primitive_visible,feature_map=litegs.render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                                                            lp.sh_degree,gt_image.shape[2:],pp,culled_features)
                 psnr_value=psnr_metrics(img,gt_image)
                 ssim_list.append(ssim_metrics(img,gt_image).unsqueeze(0))
                 psnr_list.append(psnr_value.unsqueeze(0))

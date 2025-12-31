@@ -72,7 +72,8 @@ class Scheduler(_LRScheduler):
 def get_optimizer(xyz:torch.nn.Parameter,scale:torch.nn.Parameter,rot:torch.nn.Parameter,
                   sh_0:torch.nn.Parameter,sh_rest:torch.nn.Parameter,opacity:torch.nn.Parameter,
                   spatial_lr_scale:float,
-                  opt_setting:arguments.OptimizationParams,pipeline_setting:arguments.PipelineParams):
+                  opt_setting:arguments.OptimizationParams,pipeline_setting:arguments.PipelineParams,
+                  features:torch.nn.Parameter=None):
     
     l = [
         {'params': [xyz], 'lr': opt_setting.position_lr_init * spatial_lr_scale, "name": "xyz"},
@@ -82,6 +83,9 @@ def get_optimizer(xyz:torch.nn.Parameter,scale:torch.nn.Parameter,rot:torch.nn.P
         {'params': [scale], 'lr': opt_setting.scaling_lr, "name": "scale"},
         {'params': [rot], 'lr': opt_setting.rotation_lr, "name": "rot"}
     ]
+    if features is not None:
+        l.append({'params': [features], 'lr': opt_setting.feature_lr, "name": "features"})
+    
     if pipeline_setting.sparse_grad:
         optimizer = SparseGaussianAdam(l, lr=0, eps=1e-15,bCluster=pipeline_setting.cluster_size>0)
     else:

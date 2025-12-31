@@ -11,7 +11,7 @@ def load_checkpoint(file_path):
     for group in optimizer.param_groups:
         parameters[group['name']]=group['params'][0]
 
-    return parameters["xyz"],parameters["scale"],parameters["rot"],parameters["sh_0"],parameters["sh_rest"],parameters["opacity"],start_epoch,optimizer,schedular
+    return parameters["xyz"],parameters["scale"],parameters["rot"],parameters["sh_0"],parameters["sh_rest"],parameters["opacity"],parameters.get("features",None),start_epoch,optimizer,schedular
 
 def save_checkpoint(model_path,epoch,optimizer,schedular):
     os.makedirs(model_path, exist_ok = True) 

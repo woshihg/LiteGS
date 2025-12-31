@@ -20,6 +20,7 @@ from .. import render
 from ..utils.statistic_helper import StatisticsHelperInst
 from . import densify
 from .. import utils
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def __l1_loss(network_output:torch.Tensor, gt:torch.Tensor)->torch.Tensor:
     return torch.abs((network_output - gt)).mean()
@@ -34,6 +35,19 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     #preload
     for camera_frame in camera_frames:
         camera_frame.load_image(lp.resolution)
+        if lp.feature_dim > 0:
+            mask_path = os.path.join(lp.source_path, "masks", camera_frame.name)
+            if not os.path.exists(mask_path):
+                base_name = os.path.splitext(camera_frame.name)[0]
+                for ext in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.bmp']:
+                    potential_path = os.path.join(lp.source_path, "masks", base_name + ext)
+                    if os.path.exists(potential_path):
+                        mask_path = potential_path
+                        break
+            
+            res = camera_frame.load_mask(mask_path, lp.resolution)
+            if res is None:
+                print(f"[ WARNING ] Mask not found for {camera_frame.name} at {mask_path}")
 
     #Dataset
     if lp.eval:
@@ -49,33 +63,92 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         training_frames=camera_frames
         test_frames=None
     trainingset=CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
-    train_loader = DataLoader(trainingset, batch_size=1,shuffle=True,pin_memory=not pp.device_preload)
-    test_loader=None
-    if lp.eval:
-        testset=CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
-        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload)
+    testset=CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload) if lp.eval else None
+
+    def custom_collate_fn(batch):
+        """
+        Custom collate function to handle None values in the batch.
+        Filters out None values and stacks the remaining items.
+        """
+        filtered_batch = [item for item in batch if item is not None]
+        if len(filtered_batch) == 0:
+            raise ValueError("All elements in the batch are None.")
+
+        # Assuming the batch contains tuples, we need to handle each field separately
+        collated = []
+        for i in range(len(filtered_batch[0])):
+            field = [item[i] for item in filtered_batch]
+            if isinstance(field[0], torch.Tensor):
+                collated.append(torch.stack(field))
+            else:
+                collated.append(field)  # Keep as list for non-tensor fields
+
+        return tuple(collated)
+
+    train_loader = DataLoader(trainingset, batch_size=1, shuffle=True, pin_memory=not pp.device_preload, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(testset, batch_size=1, shuffle=False, pin_memory=not pp.device_preload, collate_fn=custom_collate_fn) if lp.eval else None
     norm_trans,norm_radius=trainingset.get_norm()
 
     #torch parameter
     cluster_origin=None
     cluster_extend=None
+    features=None
     init_points_num=init_xyz.shape[0]
     if start_checkpoint is None:
-        init_xyz=torch.tensor(init_xyz,dtype=torch.float32,device='cuda')
-        init_color=torch.tensor(init_color,dtype=torch.float32,device='cuda')
-        xyz,scale,rot,sh_0,sh_rest,opacity=scene.create_gaussians(init_xyz,init_color,lp.sh_degree)
+        ply_path = os.path.join(lp.source_path, "0000.ply")
+        if os.path.exists(ply_path):
+            print(f"Loading initial Gaussians from {ply_path}")
+            xyz,scale,rot,sh_0,sh_rest,opacity,inferred_sh_degree,loaded_features=io_manager.load_ply(ply_path,lp.sh_degree)
+            init_points_num=xyz.shape[-1]
+            xyz=torch.tensor(xyz,dtype=torch.float32,device='cuda')
+            scale=torch.tensor(scale,dtype=torch.float32,device='cuda')
+            rot=torch.tensor(rot,dtype=torch.float32,device='cuda')
+            sh_0=torch.tensor(sh_0,dtype=torch.float32,device='cuda')
+            sh_rest=torch.tensor(sh_rest,dtype=torch.float32,device='cuda')
+            opacity=torch.tensor(opacity,dtype=torch.float32,device='cuda')
+            if loaded_features is not None:
+                features = torch.tensor(loaded_features, dtype=torch.float32, device='cuda')
+            else:
+                features = None
+            
+            # Pad sh_rest if inferred degree is less than target degree
+            if inferred_sh_degree < lp.sh_degree:
+                print(f"Padding SH coefficients from degree {inferred_sh_degree} to {lp.sh_degree}")
+                num_points = sh_rest.shape[2]
+                target_sh_count = (lp.sh_degree + 1) ** 2 - 1
+                current_sh_count = sh_rest.shape[0]
+                if target_sh_count > current_sh_count:
+                    extra_sh = torch.zeros((target_sh_count - current_sh_count, 3, num_points), device='cuda')
+                    sh_rest = torch.cat([sh_rest, extra_sh], dim=0)
+        else:
+            init_xyz=torch.tensor(init_xyz,dtype=torch.float32,device='cuda')
+            init_color=torch.tensor(init_color,dtype=torch.float32,device='cuda')
+            xyz,scale,rot,sh_0,sh_rest,opacity=scene.create_gaussians(init_xyz,init_color,lp.sh_degree)
+        
+        if lp.feature_dim == 0:
+            features = None
+        elif features is None:
+            features = torch.zeros((lp.feature_dim, xyz.shape[-1]), device='cuda')
+
         if pp.cluster_size:
-            xyz,scale,rot,sh_0,sh_rest,opacity=scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
+            if features is not None:
+                xyz,scale,rot,sh_0,sh_rest,opacity,features=scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity,features)
+            else:
+                xyz,scale,rot,sh_0,sh_rest,opacity=scene.cluster.cluster_points(pp.cluster_size,xyz,scale,rot,sh_0,sh_rest,opacity)
+        
         xyz=torch.nn.Parameter(xyz)
         scale=torch.nn.Parameter(scale)
         rot=torch.nn.Parameter(rot)
         sh_0=torch.nn.Parameter(sh_0)
         sh_rest=torch.nn.Parameter(sh_rest)
         opacity=torch.nn.Parameter(opacity)
-        opt,schedular=optimizer.get_optimizer(xyz,scale,rot,sh_0,sh_rest,opacity,norm_radius,op,pp)
+        if features is not None:
+            features=torch.nn.Parameter(features)
+            
+        opt,schedular=optimizer.get_optimizer(xyz,scale,rot,sh_0,sh_rest,opacity,norm_radius,op,pp,features)
         start_epoch=0
     else:
-        xyz,scale,rot,sh_0,sh_rest,opacity,start_epoch,opt,schedular=io_manager.load_checkpoint(start_checkpoint)
+        xyz,scale,rot,sh_0,sh_rest,opacity,features,start_epoch,opt,schedular=io_manager.load_checkpoint(start_checkpoint)
     if pp.cluster_size:
         cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
     actived_sh_degree=0
@@ -108,24 +181,31 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
 
         with StatisticsHelperInst.try_start(epoch):
-            for view_matrix,proj_matrix,frustumplane,gt_image,idx in train_loader:
+            for view_matrix,proj_matrix,frustumplane,gt_image,idx,gt_mask in train_loader:
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
                 idx=idx.cuda()
+                if gt_mask is not None:
+                    if isinstance(gt_mask, (list, tuple)):
+                        if gt_mask[0] is not None:
+                            gt_mask = gt_mask.cuda().float() / 255.0
+                    else:
+                        gt_mask = gt_mask.cuda().float() / 255.0
+                        
                 if op.learnable_viewproj:
                     #fix view matrix
                     extr=denoised_training_extr(idx)
                     intr=denoised_training_intr
                     view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
                 nvtx.range_pop()
-
                 #cluster culling
-                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-                img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                            actived_sh_degree,gt_image.shape[2:],pp)
+                visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,culled_features=render.render_preprocess(
+                    cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree,features)
+                img,transmitance,depth,normal,primitive_visible,class_feature=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
+                                                            actived_sh_degree,gt_image.shape[2:],pp,culled_features)
                 
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
@@ -133,6 +213,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 loss+=(culled_scale).square().mean()*op.reg_weight
                 if pp.enable_transmitance:
                     loss+=(1-transmitance).abs().mean()
+                
+                if class_feature is not None and gt_mask is not None:
+                    loss += torch.nn.functional.mse_loss(class_feature, gt_mask)
+
                 loss.backward()
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -150,41 +234,66 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
 
         if epoch in test_epochs:
             with torch.no_grad():
-                _cluster_origin=None
-                _cluster_extend=None
+                _cluster_origin = None
+                _cluster_extend = None
                 if pp.cluster_size:
-                    _cluster_origin,_cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
-                psnr_metrics=psnr.PeakSignalNoiseRatio(data_range=(0.0,1.0)).cuda()
-                loaders={"Trainingset":train_loader}
+                    _cluster_origin, _cluster_extend = scene.cluster.get_cluster_AABB(
+                        xyz, scale.exp(), torch.nn.functional.normalize(rot, dim=0)
+                    )
+                psnr_metrics = psnr.PeakSignalNoiseRatio(data_range=(0.0, 1.0)).cuda()
+                loaders = {"Trainingset": train_loader}
                 if lp.eval:
-                    loaders["Testset"]=test_loader
-                for name,loader in loaders.items():
-                    psnr_list=[]
-                    for view_matrix,proj_matrix,frustumplane,gt_image,idx in loader:
-                        view_matrix=view_matrix.cuda()
-                        proj_matrix=proj_matrix.cuda()
-                        frustumplane=frustumplane.cuda()
-                        gt_image=gt_image.cuda()/255.0
-                        idx=idx.cuda()
+                    loaders["Testset"] = test_loader
+                for name, loader in loaders.items():
+                    psnr_list = []
+                    for view_matrix, proj_matrix, frustumplane, gt_image, idx, gt_mask in loader:
+                        view_matrix = view_matrix.cuda()
+                        proj_matrix = proj_matrix.cuda()
+                        frustumplane = frustumplane.cuda()
+                        gt_image = gt_image.cuda() / 255.0
+                        idx = idx.cuda()
+
+                        if gt_mask is not None:
+                            if isinstance(gt_mask, (list, tuple)):
+                                gt_mask = gt_mask[0]
+                            if gt_mask is not None:
+                                gt_mask = gt_mask.cuda().float() / 255.0
+                        else:
+                            # Handle missing gt_mask by creating a default mask
+                            gt_mask = torch.ones_like(gt_image[:, 0:1, :, :], device='cuda')
+
                         if op.learnable_viewproj:
-                            if name=="Trainingset":
-                                #fix view matrix
-                                extr=denoised_training_extr(idx)
-                                intr=denoised_training_intr
+                            if name == "Trainingset":
+                                # Fix view matrix
+                                extr = denoised_training_extr(idx)
+                                intr = denoised_training_intr
                             else:
-                                nearest_idx=(extr-denoised_training_extr._parameters['weight']).abs().sum(dim=1).argmin()
-                                delta=denoised_training_extr(nearest_idx)-noise_extr[nearest_idx]
-                                extr=extr+delta
-                            view_matrix,proj_matrix,viewproj_matrix,frustumplane=utils.wrapper.CreateViewProj.apply(extr,intr,gt_image.shape[2],gt_image.shape[3],0.01,5000)
+                                nearest_idx = (
+                                    extr - denoised_training_extr._parameters['weight']
+                                ).abs().sum(dim=1).argmin()
+                                delta = denoised_training_extr(nearest_idx) - noise_extr[nearest_idx]
+                                extr = extr + delta
+                            view_matrix, proj_matrix, viewproj_matrix, frustumplane = utils.wrapper.CreateViewProj.apply(
+                                extr, intr, gt_image.shape[2], gt_image.shape[3], 0.01, 5000
+                            )
 
-                        #cluster culling
-                        visible_chunkid,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity=render.render_preprocess(cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree)
-                        img,transmitance,depth,normal,primitive_visible=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
-                                                                    actived_sh_degree,gt_image.shape[2:],pp)
-                        psnr_list.append(psnr_metrics(img,gt_image).unsqueeze(0))
-                    tqdm.write("\n[EPOCH {}] {} Evaluating: PSNR {}".format(epoch,name,torch.concat(psnr_list,dim=0).mean()))
+                        # Cluster culling
+                        visible_chunkid, culled_xyz, culled_scale, culled_rot, culled_color, culled_opacity, culled_features = render.render_preprocess(
+                            cluster_origin, cluster_extend, frustumplane, view_matrix, xyz, scale, rot, sh_0, sh_rest, opacity, op, pp, actived_sh_degree, features
+                        )
+                        img, transmitance, depth, normal, primitive_visible, feature_map = render.render(
+                            view_matrix, proj_matrix, culled_xyz, culled_scale, culled_rot, culled_color, culled_opacity,
+                            actived_sh_degree, gt_image.shape[2:], pp, culled_features
+                        )
+                        psnr_list.append(psnr_metrics(img, gt_image).unsqueeze(0))
+                    tqdm.write(
+                        f"\n[EPOCH {epoch}] {name} Evaluating: PSNR {torch.concat(psnr_list, dim=0).mean()}"
+                    )
 
-        xyz,scale,rot,sh_0,sh_rest,opacity=density_controller.step(opt,epoch)
+        params=density_controller.step(opt,epoch)
+        xyz,scale,rot,sh_0,sh_rest,opacity=params["xyz"],params["scale"],params["rot"],params["sh_0"],params["sh_rest"],params["opacity"]
+        if "features" in params:
+            features = params["features"]
         progress_bar.update()  
 
         if epoch in save_ply or epoch==total_epoch-1:
@@ -196,9 +305,15 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 save_path=os.path.join(lp.model_path,"point_cloud","iteration_{}".format(epoch))    
 
             if pp.cluster_size:
-                tensors=scene.cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+                if features is not None:
+                    tensors=scene.cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity,features)
+                else:
+                    tensors=scene.cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
             else:
-                tensors=xyz,scale,rot,sh_0,sh_rest,opacity
+                if features is not None:
+                    tensors=xyz,scale,rot,sh_0,sh_rest,opacity,features
+                else:
+                    tensors=xyz,scale,rot,sh_0,sh_rest,opacity
             param_nyp=[]
             for tensor in tensors:
                 param_nyp.append(tensor.detach().cpu().numpy())
