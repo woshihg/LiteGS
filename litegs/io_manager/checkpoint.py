@@ -11,9 +11,9 @@ def load_checkpoint(file_path):
     for group in optimizer.param_groups:
         parameters[group['name']]=group['params'][0]
 
-    return parameters["xyz"],parameters["scale"],parameters["rot"],parameters["sh_0"],parameters["sh_rest"],parameters["opacity"],parameters.get("features",None),start_epoch,optimizer,schedular
+    return parameters["xyz"],parameters["scale"],parameters["rot"],parameters["sh_0"],parameters["sh_rest"],parameters["opacity"],parameters.get("features",None),start_epoch,optimizer,schedular,loaded_dict.get("classifier",None),loaded_dict.get("cls_optimizer",None)
 
-def save_checkpoint(model_path,epoch,optimizer,schedular):
+def save_checkpoint(model_path,epoch,optimizer,schedular,classifier=None,cls_optimizer=None):
     os.makedirs(model_path, exist_ok = True) 
     file_path=os.path.join(model_path,"chkpnt{0}.pth".format(epoch))
     save_dict={
@@ -21,5 +21,9 @@ def save_checkpoint(model_path,epoch,optimizer,schedular):
         "optimizer":optimizer,
         "schedular":schedular
     }
+    if classifier is not None:
+        save_dict["classifier"] = classifier.state_dict()
+    if cls_optimizer is not None:
+        save_dict["cls_optimizer"] = cls_optimizer.state_dict()
     torch.save(save_dict,file_path)
     return

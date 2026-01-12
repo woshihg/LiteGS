@@ -80,6 +80,7 @@ class ImageFrame:
         self.xys:npt.NDArray=np.array(xys)
         self.image={}
         self.mask={}
+        self.depth={}
         return
     
     def load_image(self,downsample:int=-1):
@@ -107,6 +108,41 @@ class ImageFrame:
                 resolution = (int(orig_w / scale), int(orig_h / scale))  
             self.image[downsample]=np.array(image.resize(resolution),dtype=np.uint8).transpose(2,0,1)
         return self.image[downsample]
+
+    def load_depth(self,depth_source:str,downsample:int=-1):
+        if self.depth.get(downsample,None) is None:
+            if not os.path.exists(depth_source):
+                return None
+            
+            # Load depth image (assuming 16-bit PNG or similar)
+            depth_img = cv2.imread(depth_source, cv2.IMREAD_UNCHANGED)
+            if depth_img is None:
+                return None
+            
+            if len(depth_img.shape) == 3:
+                depth_img = depth_img[:,:,0]
+            
+            orig_h, orig_w = depth_img.shape
+            if downsample in [1, 2, 4, 8]:
+                resolution = round(orig_w/ downsample), round(orig_h/ downsample)
+            else:
+                if downsample == -1:
+                    global_down = orig_w / 1600 if orig_w > 1600 else 1
+                else:
+                    global_down = orig_w / downsample
+                scale = float(global_down)
+                resolution = (int(orig_w / scale), int(orig_h / scale))
+            
+            depth_img = cv2.resize(depth_img, resolution, interpolation=cv2.INTER_NEAREST)
+            # Convert to float32 and normalize if needed (assuming mm for 16-bit)
+            # Here we just keep it as is or convert to meters if it's 16-bit mm
+            if depth_img.dtype == np.uint16:
+                depth_img = depth_img.astype(np.float32) / 1000.0
+            else:
+                depth_img = depth_img.astype(np.float32)
+                
+            self.depth[downsample] = depth_img[np.newaxis, ...]
+        return self.depth[downsample]
 
     def load_mask(self,mask_source:str,downsample:int=-1):
         if self.mask.get(downsample,None) is None:
@@ -249,12 +285,17 @@ class CameraFrameDataset(Dataset):
     def __len__(self):
         return len(self.frames)
     
-    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor|None]:
+    def __getitem__(self,idx:int)->tuple[torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor,torch.Tensor|None,torch.Tensor|None]:
         image=self.frames[idx].load_image(self.downsample)
         mask=self.frames[idx].mask.get(self.downsample,None)
         if mask is not None:
             if not torch.is_tensor(mask):
                 mask=torch.tensor(mask)
+        
+        depth=self.frames[idx].depth.get(self.downsample,None)
+        if depth is not None:
+            if not torch.is_tensor(depth):
+                depth=torch.tensor(depth)
 
         view_matrix=self.frames[idx].get_viewmatrix()
         proj_matrix=self.cameras[self.frames[idx].camera_id].get_project_matrix()
@@ -263,7 +304,7 @@ class CameraFrameDataset(Dataset):
         if self.idx_array is not None:
             idx=self.idx_array[idx]
         
-        return view_matrix,proj_matrix,frustumplane,image,idx,mask
+        return view_matrix,proj_matrix,frustumplane,image,idx,mask,depth
     
     def get_norm(self)->tuple[float,float]:
         def get_center_and_diag(cam_centers):

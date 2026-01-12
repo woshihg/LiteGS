@@ -59,13 +59,15 @@ class ModelParams(ParamGroup):
 
     sh_degree = 3
     feature_dim = 0
+    num_classes = 4
     _source_path = ""
     _model_path = ""
     _images = "images"
+    _depths = "depth"
     _resolution = -1
     _white_background = False
     data_device = "cuda"
-    eval = False
+    eval = True
 
 class PipelineParams(ParamGroup):
     cluster_size = 128
@@ -73,7 +75,7 @@ class PipelineParams(ParamGroup):
     sparse_grad = True
     device_preload = True
     enable_transmitance=False
-    enable_depth=False
+    enable_depth=True
     input_color_type='sh'#'rgb' or 'sh'
     def __init__(self, parser):
         super().__init__(parser, "Pipeline Parameters")
@@ -88,8 +90,9 @@ class OptimizationParams(ParamGroup):
     scaling_lr = 0.005
     rotation_lr = 0.001
     lambda_dssim = 0.2
-    reg_weight = 0.0
-    classification_iter = 10
+    lambda_depth = 0.0
+    reg_weight = 10.0
+    classification_iter = 2
     learnable_viewproj = False
     def __init__(self, parser):
         super().__init__(parser, "Optimization Parameters")
@@ -98,10 +101,10 @@ class DensifyParams(ParamGroup):
     densification_interval = 5
     densify_from = 3
     densify_until = -1
-    opacity_reset_interval = 10
-    opacity_reset_mode='decay'#'decay','reset'
-    prune_mode='weight'#'weight','threshold'
-    target_primitives=1000000
+    opacity_reset_interval = 20
+    opacity_reset_mode='reset'#'decay','reset'
+    prune_mode='threshold'#'weight','threshold'
+    target_primitives=10000000
     
 
 

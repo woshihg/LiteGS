@@ -45,6 +45,7 @@ struct PackedGrad
 {
     float ndc_x;
     float ndc_y;
+    float ndc_z;
     float inv_cov00;
     float inv_cov01;
     float inv_cov11;
@@ -58,6 +59,7 @@ struct PackedGradClassification
 {
     float ndc_x;
     float ndc_y;
+    float ndc_z;
     float inv_cov00;
     float inv_cov01;
     float inv_cov11;
@@ -92,6 +94,7 @@ struct RegisterBuffer
     half2 t;
     unsigned int lst_contributor;//simd ushort2
     half2 alpha;
+    half2 depth;
 };
 
 struct RegisterBufferClassification
@@ -102,6 +105,7 @@ struct RegisterBufferClassification
     half2 t;
     unsigned int lst_contributor;//simd ushort2
     half2 alpha;
+    half2 depth;
     half2 category[16];
 };
 
@@ -254,6 +258,7 @@ __global__ void raster_forward_kernel(
             reg_buffer[i].b = half2(0, 0); // Initialize blue channel.
             reg_buffer[i].t = half2(SCALER, SCALER); // Initialize transparency to avoid underflow.
             reg_buffer[i].lst_contributor = 0; // Initialize last contributor ID.
+            reg_buffer[i].depth = half2(0, 0); // Initialize depth.
         }
 
         // Process points in the tile.
@@ -325,6 +330,7 @@ __global__ void raster_forward_kernel(
                     reg_buffer[i].r += (point_color_x2.r * weight);
                     reg_buffer[i].g += (point_color_x2.g * weight);
                     reg_buffer[i].b += (point_color_x2.b * weight);
+                    reg_buffer[i].depth += (half2(params.depth, params.depth) * weight);
                     reg_buffer[i].t = reg_buffer[i].t * (half2(1.0f, 1.0f) - reg_buffer[i].alpha);
                 }
                 any_active = __any_sync(0xffffffff, any_active);
@@ -369,6 +375,12 @@ __global__ void raster_forward_kernel(
 
             ourput_t[output_y][output_x] = float(reg_buffer[i].t.x) * INV_SCALER;
             ourput_t[output_y + 1][output_x] = float(reg_buffer[i].t.y) * INV_SCALER;
+
+            if (output_depth.size(1) != 0)
+            {
+                output_depth[batch_id][0][tile_index][output_y][output_x] = float(reg_buffer[i].depth.x) * INV_SCALER;
+                output_depth[batch_id][0][tile_index][output_y + 1][output_x] = float(reg_buffer[i].depth.y) * INV_SCALER;
+            }
 
             output_last_index[output_y][output_x] = reg_buffer[i].lst_contributor & 0xffff;
             output_last_index[output_y + 1][output_x] = (reg_buffer[i].lst_contributor >> 16) & 0xffff;
@@ -422,6 +434,7 @@ __global__ void raster_forward_kernel_classification(
             reg_buffer[i].b = half2(0, 0);
             reg_buffer[i].t = half2(SCALER, SCALER);
             reg_buffer[i].lst_contributor = 0;
+            reg_buffer[i].depth = half2(0, 0);
             #pragma unroll
             for (int j = 0; j < 16; j++)
                 reg_buffer[i].category[j] = half2(0, 0);
@@ -437,7 +450,7 @@ __global__ void raster_forward_kernel_classification(
             {
                 int point_id = points_id_in_tile[index_in_tile];
                 PackedParamsClassification params = *((PackedParamsClassification*)&packed_params[batch_id][point_id][0]);
-
+                
                 RGBA16x2 point_color_x2;
                 point_color_x2.r = half2(params.rg.x, params.rg.x);
                 point_color_x2.g = half2(params.rg.y, params.rg.y);
@@ -495,6 +508,7 @@ __global__ void raster_forward_kernel_classification(
                     reg_buffer[i].r += (point_color_x2.r * weight);
                     reg_buffer[i].g += (point_color_x2.g * weight);
                     reg_buffer[i].b += (point_color_x2.b * weight);
+                    reg_buffer[i].depth += (half2(params.depth, params.depth) * weight);
                     #pragma unroll
                     for (int j = 0; j < 16; j++)
                         reg_buffer[i].category[j] += (point_cat_x2[j] * weight);
@@ -547,6 +561,12 @@ __global__ void raster_forward_kernel_classification(
 
             ourput_t[output_y][output_x] = float(reg_buffer[i].t.x) * INV_SCALER;
             ourput_t[output_y + 1][output_x] = float(reg_buffer[i].t.y) * INV_SCALER;
+
+            if (output_depth.size(1) != 0)
+            {
+                output_depth[batch_id][0][tile_index][output_y][output_x] = float(reg_buffer[i].depth.x) * INV_SCALER;
+                output_depth[batch_id][0][tile_index][output_y + 1][output_x] = float(reg_buffer[i].depth.y) * INV_SCALER;
+            }
 
             output_last_index[output_y][output_x] = reg_buffer[i].lst_contributor & 0xffff;
             output_last_index[output_y + 1][output_x] = (reg_buffer[i].lst_contributor >> 16) & 0xffff;
@@ -1034,6 +1054,7 @@ struct BackwardRegisterBuffer
     half2 b;
     half2 t;
     half2 alpha;
+    half2 depth;
 };
 
 struct BackwardRegisterBufferClassification
@@ -1044,6 +1065,7 @@ struct BackwardRegisterBufferClassification
     half2 category[16];
     half2 t;
     half2 alpha;
+    half2 depth;
 };
 
 
@@ -1071,6 +1093,7 @@ __global__ void raster_backward_kernel_classification(
 
     __shared__ half2 shared_img_grad[3][PIXELS_PER_THREAD][4 * 32];
     __shared__ half2 shared_cat_grad[16][PIXELS_PER_THREAD][4 * 32];
+    __shared__ half2 shared_depth_grad[PIXELS_PER_THREAD][4 * 32];
     __shared__ half2 shared_trans_grad_buffer[PIXELS_PER_THREAD][4 * 32];
     __shared__ unsigned int shared_last_contributor[PIXELS_PER_THREAD][4 * 32];
 
@@ -1097,6 +1120,7 @@ __global__ void raster_backward_kernel_classification(
                 reg_buffer[i].r = half2(0.0f, 0.0f);
                 reg_buffer[i].g = half2(0.0f, 0.0f);
                 reg_buffer[i].b = half2(0.0f, 0.0f);
+                reg_buffer[i].depth = half2(0.0f, 0.0f);
                 #pragma unroll
                 for (int j = 0; j < 16; j++)
                     reg_buffer[i].category[j] = half2(0.0f, 0.0f);
@@ -1123,6 +1147,13 @@ __global__ void raster_backward_kernel_classification(
                     shared_cat_grad[j][i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
                         d_category_img[batch_id][j][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
                         d_category_img[batch_id][j][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
+                }
+
+                if (enable_depth_grad)
+                {
+                    shared_depth_grad[i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
+                        d_depth_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
+                        d_depth_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
                 }
 
                 if (enable_trans_grad)
@@ -1173,6 +1204,7 @@ __global__ void raster_backward_kernel_classification(
                 half2 grad_r = half2(0, 0);
                 half2 grad_g = half2(0, 0);
                 half2 grad_b = half2(0, 0);
+                half2 grad_z = half2(0, 0);
                 half2 grad_cat[16];
                 #pragma unroll
                 for (int j = 0; j < 16; j++) grad_cat[j] = half2(0, 0);
@@ -1219,9 +1251,16 @@ __global__ void raster_backward_kernel_classification(
                         for (int j = 0; j < 16; j++)
                             d_alpha += (point_cat_x2[j] - reg_buffer[i].category[j]) * reg_buffer[i].t * shared_cat_grad[j][i][threadIdx.y * blockDim.x + threadIdx.x];
 
+                        if (enable_depth_grad)
+                        {
+                            grad_z += weight * shared_depth_grad[i][threadIdx.y * blockDim.x + threadIdx.x];
+                            d_alpha += (half2(params.depth, params.depth) - reg_buffer[i].depth) * reg_buffer[i].t * shared_depth_grad[i][threadIdx.y * blockDim.x + threadIdx.x];
+                        }
+
                         reg_buffer[i].r += alpha * (point_color_x2.r - reg_buffer[i].r);
                         reg_buffer[i].g += alpha * (point_color_x2.g - reg_buffer[i].g);
                         reg_buffer[i].b += alpha * (point_color_x2.b - reg_buffer[i].b);
+                        reg_buffer[i].depth += alpha * (half2(params.depth, params.depth) - reg_buffer[i].depth);
                         #pragma unroll
                         for (int j = 0; j < 16; j++)
                             reg_buffer[i].category[j] += alpha * (point_cat_x2[j] - reg_buffer[i].category[j]);
@@ -1262,12 +1301,22 @@ __global__ void raster_backward_kernel_classification(
                         cat_sum[j] = s;
                     }
 
+                    float z_sum_all = 0;
+                    if (enable_depth_grad)
+                    {
+                        z_sum_all = (float)grad_z.x + (float)grad_z.y;
+                        warp_reduce_sum<float, false>(z_sum_all);
+                    }
+
                     if (threadIdx.x == 0)
                     {
                         atomicAdd(&grad_addr->r, float(rg.x) * INV_SCALER);
                         atomicAdd(&grad_addr->g, float(rg.y) * INV_SCALER);
                         atomicAdd(&grad_addr->b, float(ba.x) * INV_SCALER);
                         atomicAdd(&grad_addr->a, float(ba.y) * INV_SCALER);
+                        if (enable_depth_grad) {
+                            atomicAdd(&grad_addr->ndc_z, z_sum_all * INV_SCALER);
+                        }
                         #pragma unroll
                         for (int j = 0; j < 16; j++)
                             atomicAdd(&grad_addr->category[j], cat_sum[j] * INV_SCALER);
@@ -1334,6 +1383,7 @@ __global__ void raster_backward_kernel(
     constexpr float INV_SCALER = 1.0f / 128;
 
     __shared__ half2 shared_img_grad[3][PIXELS_PER_THREAD][4 * 32];
+    __shared__ half2 shared_depth_grad[PIXELS_PER_THREAD][4 * 32];
     __shared__ half2 shared_trans_grad_buffer[PIXELS_PER_THREAD][4 * 32];
     __shared__ unsigned int shared_last_contributor[PIXELS_PER_THREAD][4 * 32];//ushort2
 
@@ -1368,6 +1418,7 @@ __global__ void raster_backward_kernel(
                 reg_buffer[i].r = half2(0.0f, 0.0f);
                 reg_buffer[i].g = half2(0.0f, 0.0f);
                 reg_buffer[i].b = half2(0.0f, 0.0f);
+                reg_buffer[i].depth = half2(0.0f, 0.0f);
 
                 const int in_tile_x = threadIdx.x % tile_size_x;
                 const int in_tile_y = threadIdx.x / tile_size_x * PIXELS_PER_THREAD * VECTOR_SIZE;
@@ -1390,6 +1441,14 @@ __global__ void raster_backward_kernel(
                 shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
                     d_img[batch_id][2][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
                     d_img[batch_id][2][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
+
+                if (enable_depth_grad)
+                {
+                    shared_depth_grad[i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
+                        d_depth_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i][in_tile_x],
+                        d_depth_img[batch_id][0][tile_id - 1][in_tile_y + 2 * i + 1][in_tile_x]);
+                }
+
                 if (enable_trans_grad)
                 {
                     shared_img_grad[3][i][threadIdx.y * blockDim.x + threadIdx.x] = half2(
@@ -1436,6 +1495,7 @@ __global__ void raster_backward_kernel(
                 half2 grad_r = half2(0, 0);
                 half2 grad_g = half2(0, 0);
                 half2 grad_b = half2(0, 0);
+                half2 grad_z = half2(0, 0);
                 half2 err_square = half2(0, 0);
                 half2 grad_a = half2(0, 0);
                 float grad_bxcy = 0;
@@ -1461,18 +1521,28 @@ __global__ void raster_backward_kernel(
                         reinterpret_cast<unsigned int*>(&G)[0] &= valid_mask;
 
                         reg_buffer[i].t = __h2div(reg_buffer[i].t,(half2(1.0f,1.0f) - alpha));//0-2^(-10)
-                        grad_r += alpha * reg_buffer[i].t * shared_img_grad[0][i][threadIdx.y * blockDim.x + threadIdx.x];
-                        grad_g += alpha * reg_buffer[i].t * shared_img_grad[1][i][threadIdx.y * blockDim.x + threadIdx.x];
-                        grad_b += alpha * reg_buffer[i].t * shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x];
+                        
+                        half2 weight = alpha * reg_buffer[i].t;
+                        grad_r += weight * shared_img_grad[0][i][threadIdx.y * blockDim.x + threadIdx.x];
+                        grad_g += weight * shared_img_grad[1][i][threadIdx.y * blockDim.x + threadIdx.x];
+                        grad_b += weight * shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x];
 
 
                         half2 d_alpha = half2(0,0);
                         d_alpha += (point_color_x2.r - reg_buffer[i].r) * reg_buffer[i].t * shared_img_grad[0][i][threadIdx.y * blockDim.x + threadIdx.x];
                         d_alpha += (point_color_x2.g - reg_buffer[i].g) * reg_buffer[i].t * shared_img_grad[1][i][threadIdx.y * blockDim.x + threadIdx.x];
                         d_alpha += (point_color_x2.b - reg_buffer[i].b) * reg_buffer[i].t * shared_img_grad[2][i][threadIdx.y * blockDim.x + threadIdx.x];
+                        
+                        if (enable_depth_grad)
+                        {
+                            grad_z += weight * shared_depth_grad[i][threadIdx.y * blockDim.x + threadIdx.x];
+                            d_alpha += (half2(params.depth, params.depth) - reg_buffer[i].depth) * reg_buffer[i].t * shared_depth_grad[i][threadIdx.y * blockDim.x + threadIdx.x];
+                        }
+
                         reg_buffer[i].r += alpha * (point_color_x2.r - reg_buffer[i].r);//0-256
                         reg_buffer[i].g += alpha * (point_color_x2.g - reg_buffer[i].g);
                         reg_buffer[i].b += alpha * (point_color_x2.b - reg_buffer[i].b);
+                        reg_buffer[i].depth += alpha * (half2(params.depth, params.depth) - reg_buffer[i].depth);
                         if (enable_trans_grad)
                         {
                             d_alpha -= __h2div(shared_trans_grad_buffer[i][threadIdx.y * blockDim.x + threadIdx.x],
@@ -1505,12 +1575,23 @@ __global__ void raster_backward_kernel(
                     half2 ba{ grad_b.x + grad_b.y ,grad_a.x + grad_a.y };
                     warp_reduce_sum<half2, false>(rg);
                     warp_reduce_sum<half2, false>(ba);
+
+                    float z_sum_all = 0;
+                    if (enable_depth_grad)
+                    {
+                        z_sum_all = (float)grad_z.x + (float)grad_z.y;
+                        warp_reduce_sum<float, false>(z_sum_all);
+                    }
+
                     if (threadIdx.x == 0)
                     {
                         atomicAdd(&grad_addr->r, float(rg.x)* INV_SCALER);
                         atomicAdd(&grad_addr->g, float(rg.y)* INV_SCALER);
                         atomicAdd(&grad_addr->b, float(ba.x)* INV_SCALER);
                         atomicAdd(&grad_addr->a, float(ba.y)* INV_SCALER);
+                        if (enable_depth_grad) {
+                            atomicAdd(&grad_addr->ndc_z, z_sum_all * INV_SCALER);
+                        }
                     }
                     if (enable_statistic)
                     {
@@ -1578,6 +1659,7 @@ __global__ void unpack_gradient_classification(
         float scaler = grad_inv_scaler[0];
         d_ndc[blockIdx.y][0][index] = grads->ndc_x * scaler;
         d_ndc[blockIdx.y][1][index] = grads->ndc_y * scaler;
+        d_ndc[blockIdx.y][2][index] = grads->ndc_z * scaler;
         d_cov2d_inv[blockIdx.y][0][0][index] = grads->inv_cov00 * scaler;
         d_cov2d_inv[blockIdx.y][0][1][index] = grads->inv_cov01 * scaler;
         d_cov2d_inv[blockIdx.y][1][0][index] = grads->inv_cov01 * scaler;
@@ -1612,6 +1694,7 @@ __global__ void unpack_gradient(
         PackedGrad* grads = (PackedGrad*)&packed_grad[blockIdx.y][index][0];
         d_ndc[blockIdx.y][0][index] = grads->ndc_x * grad_inv_scaler[0];
         d_ndc[blockIdx.y][1][index] = grads->ndc_y * grad_inv_scaler[0];
+        d_ndc[blockIdx.y][2][index] = grads->ndc_z * grad_inv_scaler[0];
         d_cov2d_inv[blockIdx.y][0][0][index] = grads->inv_cov00 * grad_inv_scaler[0];
         d_cov2d_inv[blockIdx.y][0][1][index] = grads->inv_cov01 * grad_inv_scaler[0];
         d_cov2d_inv[blockIdx.y][1][0][index] = grads->inv_cov01 * grad_inv_scaler[0];

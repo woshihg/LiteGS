@@ -107,9 +107,17 @@ class DensityControllerOfficial(DensityControllerBase):
     def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
         transparent = (actived_opacity < self.min_opacity).squeeze()
         invisible = StatisticsHelperInst.get_global_culling()
-        invisible.shape[0]
-        prune_mask=transparent
-        prune_mask[:invisible.shape[0]]|=invisible
+        
+        too_large_screen = torch.zeros_like(transparent)
+        max_screen_size = StatisticsHelperInst.get_max('screen_size')
+        if max_screen_size is not None:
+            limit = min(too_large_screen.shape[0], max_screen_size.shape[0])
+            too_large_screen[:limit] = (max_screen_size[:limit] > self.max_screen_size).squeeze()
+
+        too_large_world = (actived_scale.max(dim=0).values > 0.1 * self.screen_extent).squeeze()
+
+        prune_mask = transparent | too_large_screen | too_large_world
+        prune_mask[:invisible.shape[0]] |= invisible
         return prune_mask
 
     @torch.no_grad()
@@ -289,6 +297,15 @@ class DensityControllerTamingGS(DensityControllerOfficial):
             weight_sum=(frag_weight*frag_count).nan_to_num(0).squeeze()
             invisible = weight_sum==0#weight_sum<(weight_sum[weight_sum!=0].quantile(0.05))
             prune_mask[:invisible.shape[0]]|=invisible
+
+            too_large_world = (actived_scale.max(dim=0).values > 0.1 * self.screen_extent).squeeze()
+            max_screen_size = StatisticsHelperInst.get_max('screen_size')
+            if max_screen_size is not None:
+                too_large_screen = (max_screen_size > self.max_screen_size).squeeze()
+                limit = min(prune_mask.shape[0], too_large_screen.shape[0])
+                prune_mask[:limit] |= too_large_screen[:limit]
+            prune_mask |= too_large_world
+
         elif self.densify_params.prune_mode == 'threshold':
             prune_mask=super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale)
         

@@ -36,6 +36,21 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     #preload
     for camera_frame in camera_frames:
         camera_frame.load_image(lp.resolution)
+        
+        # Load depth if lambda_depth > 0
+        if op.lambda_depth > 0:
+            depth_path = os.path.join(lp.source_path, lp.depths, camera_frame.name)
+            if not os.path.exists(depth_path):
+                base_name = os.path.splitext(camera_frame.name)[0]
+                for ext in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.bmp', '.tiff']:
+                    potential_path = os.path.join(lp.source_path, lp.depths, base_name + ext)
+                    if os.path.exists(potential_path):
+                        depth_path = potential_path
+                        break
+            res = camera_frame.load_depth(depth_path, lp.resolution)
+            if res is None:
+                print(f"[ WARNING ] Depth not found for {camera_frame.name} at {depth_path}")
+
         if lp.feature_dim > 0:
             mask_path = os.path.join(lp.source_path, "masks", camera_frame.name)
             if not os.path.exists(mask_path):
@@ -128,8 +143,14 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         
         if lp.feature_dim == 0:
             features = None
-        elif features is None:
-            features = torch.zeros((lp.feature_dim, xyz.shape[-1]), device='cuda')
+            classifier = None
+            cls_optimizer = None
+        else:
+            if features is None:
+                features = torch.zeros((lp.feature_dim, xyz.shape[-1]), device='cuda')
+            
+            classifier = torch.nn.Conv2d(lp.feature_dim, lp.num_classes, kernel_size=1).cuda()
+            cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
 
         if pp.cluster_size:
             if features is not None:
@@ -149,7 +170,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         opt,schedular=optimizer.get_optimizer(xyz,scale,rot,sh_0,sh_rest,opacity,norm_radius,op,pp,features)
         start_epoch=0
     else:
-        xyz,scale,rot,sh_0,sh_rest,opacity,features,start_epoch,opt,schedular=io_manager.load_checkpoint(start_checkpoint)
+        xyz,scale,rot,sh_0,sh_rest,opacity,features,start_epoch,opt,schedular,classifier_state,cls_opt_state=io_manager.load_checkpoint(start_checkpoint)
+        if lp.feature_dim > 0:
+            classifier = torch.nn.Conv2d(lp.feature_dim, lp.num_classes, kernel_size=1).cuda()
+            if classifier_state is not None:
+                classifier.load_state_dict(classifier_state)
+            cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+            if cls_opt_state is not None:
+                cls_optimizer.load_state_dict(cls_opt_state)
+        else:
+            classifier = None
+            cls_optimizer = None
     if pp.cluster_size:
         cluster_origin,cluster_extend=scene.cluster.get_cluster_AABB(xyz,scale.exp(),torch.nn.functional.normalize(rot,dim=0))
     actived_sh_degree=0
@@ -167,6 +198,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     total_epoch=int(op.iterations/len(trainingset))
     if dp.densify_until<0:
         dp.densify_until=int(total_epoch*0.8/dp.opacity_reset_interval)*dp.opacity_reset_interval+1
+    
+    if op.lambda_depth > 0:
+        pp.enable_depth = True
+        
     density_controller=densify.DensityControllerTamingGS(norm_radius,dp,pp.cluster_size>0,init_points_num)
     StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
     
@@ -176,7 +211,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     progress_bar.update(0)
 
     for epoch in range(start_epoch,total_epoch):
-
+        if classifier is not None:
+            classifier.train()
         with torch.no_grad():
             if pp.cluster_size>0 and (epoch-1)%dp.densification_interval==0:
                 xyz,scale,rot,sh_0,sh_rest,opacity=scene.spatial_refine(pp.cluster_size>0,opt,xyz)
@@ -185,7 +221,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 actived_sh_degree=min(int(epoch/5),lp.sh_degree)
 
         with StatisticsHelperInst.try_start(epoch):
-            for i, (view_matrix,proj_matrix,frustumplane,gt_image,idx,gt_mask) in enumerate(train_loader):
+            for i, (view_matrix,proj_matrix,frustumplane,gt_image,idx,gt_mask,gt_depth) in enumerate(train_loader):
                 global_step = epoch * len(train_loader) + i
                 nvtx.range_push("Iter Init")
                 view_matrix=view_matrix.cuda()
@@ -199,6 +235,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             gt_mask = gt_mask.cuda().long()
                     else:
                         gt_mask = gt_mask.cuda().long()
+                
+                if gt_depth is not None:
+                    if isinstance(gt_depth, (list, tuple)):
+                        if gt_depth[0] is not None:
+                            gt_depth = gt_depth.cuda()
+                    else:
+                        gt_depth = gt_depth.cuda()
                         
                 if op.learnable_viewproj:
                     #fix view matrix
@@ -220,16 +263,51 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
                 loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
-                loss+=(culled_scale).square().mean()*op.reg_weight
+                loss+=(culled_scale).mean()*op.reg_weight
                 if pp.enable_transmitance:
                     loss+=(1-transmitance).abs().mean()
                 
+                depth_loss = 0
+                if op.lambda_depth > 0 and depth is not None and gt_depth is not None:
+                    # Use the smaller resolution between rendered depth and gt_depth
+                    h_render, w_render = depth.shape[2:]
+                    h_gt, w_gt = gt_depth.shape[2:]
+                    target_size = (min(h_render, h_gt), min(w_render, w_gt))
+                    
+                    curr_depth = depth
+                    if depth.shape[2:] != target_size:
+                        curr_depth = torch.nn.functional.interpolate(depth, size=target_size, mode='bilinear', align_corners=False)
+                    
+                    curr_gt_depth = gt_depth
+                    if gt_depth.shape[2:] != target_size:
+                        # Use nearest for gt depth to avoid blurring edges/invalid pixels
+                        curr_gt_depth = torch.nn.functional.interpolate(gt_depth, size=target_size, mode='nearest')
+                    
+                    depth_mask = (curr_gt_depth > 0).float()
+                    depth_loss = (curr_depth - curr_gt_depth).abs() * depth_mask
+                    depth_loss = depth_loss.sum() / (depth_mask.sum() + 1e-7)
+                    loss += op.lambda_depth * depth_loss
+
                 class_loss = 0
                 if do_classification and class_feature is not None and gt_mask is not None:
-                    # gt_mask stores category indices [B, 1, H, W], class_feature stores one-hot [B, 16, H, W]
-                    gt_one_hot = torch.nn.functional.one_hot(gt_mask.squeeze(1).long(), num_classes=class_feature.shape[1])
-                    gt_one_hot = gt_one_hot.permute(0, 3, 1, 2).float()
-                    class_loss = torch.nn.functional.mse_loss(class_feature, gt_one_hot)
+                    # Use classifier to get logits
+                    logits = classifier(class_feature)
+                    
+                    # Use the smaller resolution between logits and gt_mask
+                    h_logits, w_logits = logits.shape[2:]
+                    h_mask, w_mask = gt_mask.shape[2:]
+                    target_size = (min(h_logits, h_mask), min(w_logits, w_mask))
+                    
+                    curr_logits = logits
+                    if logits.shape[2:] != target_size:
+                        curr_logits = torch.nn.functional.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
+                    
+                    curr_gt_mask = gt_mask
+                    if gt_mask.shape[2:] != target_size:
+                        curr_gt_mask = torch.nn.functional.interpolate(gt_mask.float(), size=target_size, mode='nearest').long()
+                        
+                    # gt_mask is [B, 1, H, W], logits is [B, num_classes, H, W]
+                    class_loss = torch.nn.functional.cross_entropy(curr_logits, curr_gt_mask.squeeze(1).long())
                     loss += class_loss
  
                 loss.backward()
@@ -239,9 +317,14 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     writer.add_scalar('train/total_loss', loss.item(), global_step)
                     writer.add_scalar('train/l1_loss', l1_loss.item(), global_step)
                     writer.add_scalar('train/ssim_loss', ssim_loss.item(), global_step)
+                    if op.lambda_depth > 0:
+                        writer.add_scalar('train/depth_loss', depth_loss.item() if isinstance(depth_loss, torch.Tensor) else depth_loss, global_step)
                     if class_feature is not None:
                         writer.add_scalar('train/class_loss', class_loss.item() if isinstance(class_loss, torch.Tensor) else class_loss, global_step)
-                    writer.add_scalar('train/num_points', xyz.shape[-1] * (xyz.shape[-2] if pp.cluster_size else 1), global_step)
+                    
+                    num_points = xyz.shape[-1] * (xyz.shape[-2] if pp.cluster_size else 1)
+                    writer.add_scalar('train/num_points', num_points, global_step)
+                    writer.add_scalar('train/avg_scale', scale.exp().mean().item(), global_step)
 
                 if StatisticsHelperInst.bStart:
                     StatisticsHelperInst.backward_callback()
@@ -250,6 +333,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 else:
                     opt.step()
                 opt.zero_grad(set_to_none = True)
+
+                if cls_optimizer is not None:
+                    cls_optimizer.step()
+                    cls_optimizer.zero_grad(set_to_none = True)
+
                 if op.learnable_viewproj:
                     view_opt.step()
                     view_opt.zero_grad()
@@ -258,6 +346,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 schedular.step()
 
         if epoch in test_epochs:
+            if classifier is not None:
+                classifier.eval()
             with torch.no_grad():
                 _cluster_origin = None
                 _cluster_extend = None
@@ -271,7 +361,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loaders["Testset"] = test_loader
                 for name, loader in loaders.items():
                     psnr_list = []
-                    for view_matrix, proj_matrix, frustumplane, gt_image, idx, gt_mask in loader:
+                    for i, (view_matrix, proj_matrix, frustumplane, gt_image, idx, gt_mask, gt_depth) in enumerate(loader):
                         view_matrix = view_matrix.cuda()
                         proj_matrix = proj_matrix.cuda()
                         frustumplane = frustumplane.cuda()
@@ -286,6 +376,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         else:
                             # Handle missing gt_mask by creating a default mask
                             gt_mask = torch.ones_like(gt_image[:, 0:1, :, :], device='cuda')
+                        
+                        if gt_depth is not None:
+                            if isinstance(gt_depth, (list, tuple)):
+                                gt_depth = gt_depth[0]
+                            if gt_depth is not None:
+                                gt_depth = gt_depth.cuda()
 
                         if op.learnable_viewproj:
                             if name == "Trainingset":
@@ -310,9 +406,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             view_matrix, proj_matrix, culled_xyz, culled_scale, culled_rot, culled_color, culled_opacity,
                             actived_sh_degree, gt_image.shape[2:], pp, culled_features
                         )
+                        
+                        # Log images to TensorBoard
+                        if i == 0:
+                            writer.add_image(f'test/{name}_render', img[0], epoch)
+                            writer.add_image(f'test/{name}_gt', gt_image[0], epoch)
+
                         psnr_list.append(psnr_metrics(img, gt_image).unsqueeze(0))
+                    
+                    avg_psnr = torch.concat(psnr_list, dim=0).mean()
+                    writer.add_scalar(f'test/{name}_psnr', avg_psnr, epoch)
                     tqdm.write(
-                        f"\n[EPOCH {epoch}] {name} Evaluating: PSNR {torch.concat(psnr_list, dim=0).mean()}"
+                        f"\n[EPOCH {epoch}] {name} Evaluating: PSNR {avg_psnr}"
                     )
 
         params=density_controller.step(opt,epoch)
@@ -345,10 +450,18 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             io_manager.save_ply(os.path.join(save_path,"point_cloud.ply"),*param_nyp)
 
             # Save separate PLY files for each category if features exist
-            if features is not None and features.shape[0] > 0:
+            if features is not None and classifier is not None:
                 # features is the last element in tensors
                 feat_tensor = tensors[-1]
-                categories = torch.argmax(feat_tensor, dim=0)
+                # feat_tensor is [C, N]
+                classifier.eval()
+                with torch.no_grad():
+                    # Use classifier to get categories for each point
+                    # Conv2d expects [B, C, H, W], so we use [1, C, N, 1]
+                    logits = classifier(feat_tensor.unsqueeze(0).unsqueeze(-1)).squeeze(0).squeeze(-1)
+                    categories = torch.argmax(logits, dim=0)
+                classifier.train()
+                
                 unique_cats = torch.unique(categories)
                 print(f"Saving {len(unique_cats)} categories to separate PLY files...")
                 for cat in unique_cats:
@@ -362,7 +475,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 torch.save(list(denoised_training_extr.parameters())+[denoised_training_intr],os.path.join(save_path,"viewproj.pth"))
 
         if epoch in save_checkpoint:
-            io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular)
+            io_manager.save_checkpoint(lp.model_path,epoch,opt,schedular,classifier,cls_optimizer)
     
     writer.close()
     return

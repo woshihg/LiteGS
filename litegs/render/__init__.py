@@ -85,9 +85,12 @@ def render(view_matrix:torch.Tensor,proj_matrix:torch.Tensor,
     hom_pos = hom_pos.transpose(1,2)
     hom_pos = hom_pos.contiguous()
 
-    ndc_pos=hom_pos/(hom_pos[:,3:4,:]+1e-7)
-
     view_depth=(view_matrix.transpose(1,2)@xyz)[:,2]
+
+    ndc_pos=hom_pos/(hom_pos[:,3:4,:]+1e-7)
+    # 使用 view_depth (线性相机空间 Z) 替换 NDC Z，确保深度图渲染正确
+    ndc_pos[:, 2, :] = view_depth
+    
     nvtx.range_pop()
     
     #visibility table

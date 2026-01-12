@@ -474,12 +474,28 @@ class GaussiansRasterFunc(torch.autograd.Function):
         #     breakpoint()
         
 
-        grad_rgb_image_max=grad_rgb_image.abs().max()
-        grad_rgb_image=grad_rgb_image/grad_rgb_image_max
+        grad_rgb_image_max=grad_rgb_image.abs().max().clamp_min(1e-6)
+        grad_depth_image_max = grad_depth_image.abs().max() if grad_depth_image is not None else torch.tensor(0.0, device=grad_rgb_image.device)
+        
+        # 建议：如果深度梯度比颜色梯度弱很多，给它一个 Boost，否则 FP16 截断会非常严重
+        # 我们使用一个独立的缩放系数，或者将深度梯度提升到与颜色梯度相当的量级
+        depth_boost = 1.0
+        if grad_depth_image_max > 0 and grad_depth_image_max < grad_rgb_image_max * 0.1:
+            depth_boost = (grad_rgb_image_max / grad_depth_image_max).item() * 0.5
+            
+        grad_rgb_image = grad_rgb_image / grad_rgb_image_max
+        if grad_depth_image is not None:
+            grad_depth_image = (grad_depth_image * depth_boost) / grad_rgb_image_max
+            
         grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,_,grad_o_square=litegs_fused.rasterize_backward(sorted_pointId,tile_start_index,packed_params,tiles,
                                                                                           transmitance,lst_contributor,
                                                                                           grad_rgb_image,grad_transmitance_image,grad_depth_image,grad_rgb_image_max,
                                                                                           img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart)
+
+        if grad_depth_image is not None:
+            grad_ndc[:, 2, :] = grad_ndc[:, 2, :] / depth_boost # 恢复真实的梯度量级给 PyTorch 分发
+            # 注意：由于 grad_opacities 等也受到了 depth_boost 的影响，理论上它们也变强了，
+            # 这通常是好事，因为深度损失通常需要更强的信号来竞争。
         if StatisticsHelperInst.bStart:
             #if err_sum.isinf().any() or err_square_sum.isinf().any():
             #    breakpoint()
@@ -556,15 +572,27 @@ class GaussiansRasterFuncClassification(torch.autograd.Function):
 
         grad_rgb_image_max=grad_rgb_image.abs().max()
         grad_category_image_max=grad_category_image.abs().max()
+        grad_depth_image_max = grad_depth_image.abs().max() if grad_depth_image is not None else torch.tensor(0.0, device=grad_rgb_image.device)
+        
         combined_max = torch.max(grad_rgb_image_max, grad_category_image_max).clamp_min(1e-6)
+
+        # 同样为分类路径添加 Boost
+        depth_boost = 1.0
+        if grad_depth_image_max > 0 and grad_depth_image_max < combined_max * 0.1:
+            depth_boost = (combined_max / grad_depth_image_max).item() * 0.5
 
         grad_rgb_image=grad_rgb_image/combined_max
         grad_category_image=grad_category_image/combined_max
+        if grad_depth_image is not None:
+            grad_depth_image = (grad_depth_image * depth_boost) / combined_max
 
         grad_ndc,grad_cov2d_inv,grad_color,grad_opacities,grad_classification,_,grad_o_square=litegs_fused.rasterize_backward_classification(sorted_pointId,tile_start_index,packed_params,tiles,
                                                                                           transmitance,lst_contributor,
                                                                                           grad_rgb_image,grad_category_image,grad_transmitance_image,grad_depth_image,combined_max,
                                                                                           img_h,img_w,tile_h,tile_w,StatisticsHelperInst.bStart)
+
+        if grad_depth_image is not None:
+            grad_ndc[:, 2, :] = grad_ndc[:, 2, :] / depth_boost
         
         if StatisticsHelperInst.bStart:
             StatisticsHelperInst.update_mean_std("fragment_weight",fragment_weight,fragment_weight*fragment_weight,fragment_count,None)
@@ -790,6 +818,12 @@ class Binning(BaseWrapper):
         #allocate
         if StatisticsHelperInst.bStart:
             StatisticsHelperInst.update_visible_count(b_visible)
+            screen_size = (pixel_right_down - pixel_left_up).max(dim=1).values
+            if screen_size.dim() > 1:
+                screen_size = screen_size.max(dim=0).values
+            
+            # 转换为 float 以匹配 StatisticsHelper 的数据类型
+            StatisticsHelperInst.update_max_min_compact("screen_size", screen_size.unsqueeze(0).float())
 
         #sort by depth
         values,depth_sorted_index=view_depth.sort(dim=-1,descending=False)

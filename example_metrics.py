@@ -111,7 +111,7 @@ if __name__ == "__main__":
             ssim_list=[]
             psnr_list=[]
             lpips_list=[]
-            for index,(view_matrix,proj_matrix,frustumplane,gt_image,idx) in enumerate(loader):
+            for index,(view_matrix,proj_matrix,frustumplane,gt_image,idx,gt_mask,gt_depth) in enumerate(loader):
                 view_matrix=view_matrix.cuda()
                 proj_matrix=proj_matrix.cuda()
                 frustumplane=frustumplane.cuda()
