@@ -147,7 +147,6 @@ class ImageFrame:
     def load_mask(self,mask_source:str,downsample:int=-1):
         if self.mask.get(downsample,None) is None:
             if not os.path.exists(mask_source):
-                print(f"[ WARN ] Mask file {mask_source} does not exist, using full mask.")
                 return None
             mask:PIL.Image.Image=PIL.Image.open(mask_source)
 

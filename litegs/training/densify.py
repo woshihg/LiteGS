@@ -104,20 +104,24 @@ class DensityControllerOfficial(DensityControllerBase):
         return
     
     @torch.no_grad()
-    def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
+    def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor, use_scale_control:bool=False)->torch.Tensor:
         transparent = (actived_opacity < self.min_opacity).squeeze()
         invisible = StatisticsHelperInst.get_global_culling()
-        
-        too_large_screen = torch.zeros_like(transparent)
-        max_screen_size = StatisticsHelperInst.get_max('screen_size')
-        if max_screen_size is not None:
-            limit = min(too_large_screen.shape[0], max_screen_size.shape[0])
-            too_large_screen[:limit] = (max_screen_size[:limit] > self.max_screen_size).squeeze()
+        if not use_scale_control:
+            invisible.shape[0]
+            prune_mask=transparent
+            prune_mask[:invisible.shape[0]]|=invisible
+        else:                        
+            too_large_screen = torch.zeros_like(transparent)
+            max_screen_size = StatisticsHelperInst.get_max('screen_size')
+            if max_screen_size is not None:
+                limit = min(too_large_screen.shape[0], max_screen_size.shape[0])
+                too_large_screen[:limit] = (max_screen_size[:limit] > self.max_screen_size).squeeze()
 
-        too_large_world = (actived_scale.max(dim=0).values > 0.1 * self.screen_extent).squeeze()
+            too_large_world = (actived_scale.max(dim=0).values > 0.1 * self.screen_extent).squeeze()
 
-        prune_mask = transparent | too_large_screen | too_large_world
-        prune_mask[:invisible.shape[0]] |= invisible
+            prune_mask = transparent | too_large_screen | too_large_world
+            prune_mask[:invisible.shape[0]] |= invisible
         return prune_mask
 
     @torch.no_grad()
@@ -137,7 +141,7 @@ class DensityControllerOfficial(DensityControllerBase):
         return selected_pts_mask
     
     @torch.no_grad()
-    def prune(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def prune(self,optimizer:torch.optim.Optimizer,epoch:int, large_limit:bool=False):
         
         param_dict=self._get_params_from_optimizer(optimizer)
         xyz=param_dict["xyz"]
@@ -151,7 +155,7 @@ class DensityControllerOfficial(DensityControllerBase):
             chunk_size=xyz.shape[-1]
             xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
-        prune_mask=self.get_prune_mask(opacity.sigmoid(),scale.exp())
+        prune_mask=self.get_prune_mask(opacity.sigmoid(),scale.exp(), use_scale_control=large_limit)
         if prune_mask.sum()>0.8*opacity.shape[1]:
             assert(False) #debug
         if self.bCluster:
@@ -179,7 +183,10 @@ class DensityControllerOfficial(DensityControllerBase):
 
         if self.bCluster:
             chunk_size=xyz.shape[-1]
-            xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
+            if features is not None:
+                xyz,scale,rot,sh_0,sh_rest,opacity,features=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity,features)
+            else:
+                xyz,scale,rot,sh_0,sh_rest,opacity=cluster.uncluster(xyz,scale,rot,sh_0,sh_rest,opacity)
 
         clone_mask=self.get_clone_mask(scale.exp())
         split_mask=self.get_split_mask(scale.exp())
@@ -217,14 +224,37 @@ class DensityControllerOfficial(DensityControllerBase):
         clone_opacity=opacity[...,clone_mask]
         append_opacity = torch.cat((split_opacity,clone_opacity),dim=-1)
 
+        if features is not None:
+            split_features = features[..., split_mask]
+            clone_features = features[..., clone_mask]
+            append_features = torch.cat((split_features, clone_features), dim=-1)
+
         if self.bCluster:
             N=append_xyz.shape[-1]
             chunk_num=int(N/chunk_size)
             append_limit=chunk_num*chunk_size
-            append_xyz,append_scale,append_rot,append_sh_0,append_sh_rest,append_opacity=cluster.cluster_points(
-                chunk_size,append_xyz[...,:append_limit],append_scale[...,:append_limit],
-                append_rot[...,:append_limit],append_sh_0[...,:append_limit],
-                append_sh_rest[...,:append_limit],append_opacity[...,:append_limit])
+            
+            cluster_args = [
+                append_xyz[...,:append_limit],
+                append_scale[...,:append_limit],
+                append_rot[...,:append_limit],
+                append_sh_0[...,:append_limit],
+                append_sh_rest[...,:append_limit],
+                append_opacity[...,:append_limit]
+            ]
+            if features is not None:
+                cluster_args.append(append_features[...,:append_limit])
+            
+            clustered_results = cluster.cluster_points(chunk_size, *cluster_args)
+            
+            append_xyz = clustered_results[0]
+            append_scale = clustered_results[1]
+            append_rot = clustered_results[2]
+            append_sh_0 = clustered_results[3]
+            append_sh_rest = clustered_results[4]
+            append_opacity = clustered_results[5]
+            if features is not None:
+                append_features = clustered_results[6]
 
         dict_clone = {"xyz": append_xyz,
                       "scale": append_scale,
@@ -232,6 +262,8 @@ class DensityControllerOfficial(DensityControllerBase):
                       "sh_0": append_sh_0,
                       "sh_rest": append_sh_rest,
                       "opacity" : append_opacity}
+        if features is not None:
+            dict_clone["features"] = append_features
         
         #print("\n#clone:{0} #split:{1} #points:{2}".format(clone_mask.sum().cpu(),split_mask.sum().cpu(),xyz.shape[-1]+append_xyz.shape[-1]*append_xyz.shape[-2]))
         self._cat_tensors_to_optimizer(dict_clone,optimizer)
@@ -261,12 +293,12 @@ class DensityControllerOfficial(DensityControllerBase):
             epoch%self.densify_params.densification_interval==0)
 
     @torch.no_grad()
-    def step(self,optimizer:torch.optim.Optimizer,epoch:int):
+    def step(self,optimizer:torch.optim.Optimizer,epoch:int, large_limit:bool=False):
         if epoch<self.densify_params.densify_until and epoch>=self.densify_params.densify_from:
             bUpdate=False
             if epoch%self.densify_params.densification_interval==0:
                 self.split_and_clone(optimizer,epoch)
-                self.prune(optimizer,epoch)
+                self.prune(optimizer,epoch, large_limit)
                 bUpdate=True
             if epoch%self.densify_params.opacity_reset_interval==0:
                 self.reset_opacity(optimizer,epoch)
@@ -289,7 +321,7 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         return
     
     @torch.no_grad()
-    def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor)->torch.Tensor:
+    def get_prune_mask(self,actived_opacity:torch.Tensor,actived_scale:torch.Tensor, use_scale_control:bool=False)->torch.Tensor:
         if self.densify_params.prune_mode == 'weight':
             prune_mask=torch.zeros(actived_opacity.shape[1],device=actived_opacity.device).bool()
 
@@ -297,17 +329,17 @@ class DensityControllerTamingGS(DensityControllerOfficial):
             weight_sum=(frag_weight*frag_count).nan_to_num(0).squeeze()
             invisible = weight_sum==0#weight_sum<(weight_sum[weight_sum!=0].quantile(0.05))
             prune_mask[:invisible.shape[0]]|=invisible
-
-            too_large_world = (actived_scale.max(dim=0).values > 0.1 * self.screen_extent).squeeze()
-            max_screen_size = StatisticsHelperInst.get_max('screen_size')
-            if max_screen_size is not None:
-                too_large_screen = (max_screen_size > self.max_screen_size).squeeze()
-                limit = min(prune_mask.shape[0], too_large_screen.shape[0])
-                prune_mask[:limit] |= too_large_screen[:limit]
-            prune_mask |= too_large_world
+            if use_scale_control:
+                too_large_world = (actived_scale.max(dim=0).values > 0.1 * self.screen_extent).squeeze()
+                max_screen_size = StatisticsHelperInst.get_max('screen_size')
+                if max_screen_size is not None:
+                    too_large_screen = (max_screen_size > self.max_screen_size).squeeze()
+                    limit = min(prune_mask.shape[0], too_large_screen.shape[0])
+                    prune_mask[:limit] |= too_large_screen[:limit]
+                prune_mask |= too_large_world
 
         elif self.densify_params.prune_mode == 'threshold':
-            prune_mask=super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale)
+            prune_mask=super(DensityControllerTamingGS,self).get_prune_mask(actived_opacity,actived_scale,use_scale_control)
         
         return prune_mask
     
@@ -343,7 +375,6 @@ class DensityControllerTamingGS(DensityControllerOfficial):
         budget=min(max(int(cur_target_count-xyz.shape[-1]),1)+prune_num,xyz.shape[-1])
 
         score=self.get_score(xyz,scale,rot,sh_0,sh_rest,opacity)
-        
         densify_index = torch.multinomial(score, budget, replacement=False)
         clone_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values <= self.percent_dense*self.screen_extent)]
         split_index=densify_index[(scale[:,densify_index].exp().max(dim=0).values > self.percent_dense*self.screen_extent)]

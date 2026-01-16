@@ -570,8 +570,19 @@ class GaussiansRasterFuncClassification(torch.autograd.Function):
         (img_h,img_w)=ctx.img_hw
         tile_h,tile_w=ctx.arg_tile_size
 
+        if grad_category_image is None:
+            # Need a zero tensor of correct shape [B, C, H, W]
+            # B is surely 1 from DataLoader, but let's be safe
+            B = grad_rgb_image.shape[0]
+            # We don't know C here easily from ctx, but we can get it from packed_params if we had it, 
+            # or just use a dummy since we'll handle it below.
+            # Actually, litegs_fused.rasterize_backward_classification likely handles None if C++ is smart,
+            # but usually it's better to pass a zero tensor.
+            # Wait, I don't know the feature_dim here.
+            pass
+
         grad_rgb_image_max=grad_rgb_image.abs().max()
-        grad_category_image_max=grad_category_image.abs().max()
+        grad_category_image_max=grad_category_image.abs().max() if grad_category_image is not None else torch.tensor(0.0, device=grad_rgb_image.device)
         grad_depth_image_max = grad_depth_image.abs().max() if grad_depth_image is not None else torch.tensor(0.0, device=grad_rgb_image.device)
         
         combined_max = torch.max(grad_rgb_image_max, grad_category_image_max).clamp_min(1e-6)
@@ -582,7 +593,9 @@ class GaussiansRasterFuncClassification(torch.autograd.Function):
             depth_boost = (combined_max / grad_depth_image_max).item() * 0.5
 
         grad_rgb_image=grad_rgb_image/combined_max
-        grad_category_image=grad_category_image/combined_max
+        if grad_category_image is not None:
+            grad_category_image=grad_category_image/combined_max
+        
         if grad_depth_image is not None:
             grad_depth_image = (grad_depth_image * depth_boost) / combined_max
 
@@ -931,6 +944,10 @@ class CullCompactActivateWithSparseGradClassification(torch.autograd.Function):
         chunk_size=ctx.chunk_size
         sh_degree=ctx.sh_degree
         visible_chunkid,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,classification=ctx.saved_tensors
+
+        if activated_classification_grad is None:
+            activated_classification_grad = torch.zeros((classification.shape[0], activated_position_grad.shape[1]), device=activated_position_grad.device)
+
         compactd_grads=litegs_fused.activate_backward_classification(
             visible_chunkid,view_matrix,sh_degree,xyz,scale,rot,sh_0,sh_rest,opacity,classification,
             activated_position_grad,activated_scale_grad,activated_rotation_grad,color_grad,activated_opacity_grad,activated_classification_grad)

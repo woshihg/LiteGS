@@ -8,7 +8,10 @@ import math
 import os
 import torch.cuda.nvtx as nvtx
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import json
+from datetime import datetime
+from PIL import Image
 
 from .. import arguments
 from .. import data
@@ -34,6 +37,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     cameras_info,camera_frames,init_xyz,init_color=io_manager.load_colmap_result(lp.source_path,lp.images)#lp.sh_degree,lp.resolution
 
     #preload
+    depth_count = 0
+    mask_count = 0
     for camera_frame in camera_frames:
         camera_frame.load_image(lp.resolution)
         
@@ -48,8 +53,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         depth_path = potential_path
                         break
             res = camera_frame.load_depth(depth_path, lp.resolution)
-            if res is None:
-                print(f"[ WARNING ] Depth not found for {camera_frame.name} at {depth_path}")
+            if res is not None:
+                depth_count += 1
 
         if lp.feature_dim > 0:
             mask_path = os.path.join(lp.source_path, "masks", camera_frame.name)
@@ -62,8 +67,13 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         break
             
             res = camera_frame.load_mask(mask_path, lp.resolution)
-            if res is None:
-                print(f"[ WARNING ] Mask not found for {camera_frame.name} at {mask_path}")
+            if res is not None:
+                mask_count += 1
+    
+    if op.lambda_depth > 0:
+        print(f"[ INFO ] Depth supervision found for {depth_count}/{len(camera_frames)} images")
+    if lp.feature_dim > 0:
+        print(f"[ INFO ] Mask supervision found for {mask_count}/{len(camera_frames)} images")
 
     #Dataset
     if lp.eval:
@@ -84,7 +94,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     def custom_collate_fn(batch):
         """
         Custom collate function to handle None values in the batch.
-        Filters out None values and stacks the remaining items.
+        If all items in a field are tensors, it stacks them.
+        Otherwise, it keeps them as a list.
         """
         filtered_batch = [item for item in batch if item is not None]
         if len(filtered_batch) == 0:
@@ -94,10 +105,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         collated = []
         for i in range(len(filtered_batch[0])):
             field = [item[i] for item in filtered_batch]
-            if isinstance(field[0], torch.Tensor):
+            # Only stack if all elements are tensors and not None
+            if all(isinstance(x, torch.Tensor) for x in field):
                 collated.append(torch.stack(field))
             else:
-                collated.append(field)  # Keep as list for non-tensor fields
+                collated.append(field)  # Keep as list for non-tensor or mixed fields
 
         return tuple(collated)
 
@@ -111,31 +123,32 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     features=None
     init_points_num=init_xyz.shape[0]
     if start_checkpoint is None:
-        ply_path = os.path.join(lp.source_path, "0000.ply")
-        if os.path.exists(ply_path):
-            print(f"Loading initial Gaussians from {ply_path}")
-            xyz,scale,rot,sh_0,sh_rest,opacity,inferred_sh_degree,loaded_features=io_manager.load_ply(ply_path,lp.sh_degree)
-            init_points_num=xyz.shape[-1]
-            xyz=torch.tensor(xyz,dtype=torch.float32,device='cuda')
-            scale=torch.tensor(scale,dtype=torch.float32,device='cuda')
-            rot=torch.tensor(rot,dtype=torch.float32,device='cuda')
-            sh_0=torch.tensor(sh_0,dtype=torch.float32,device='cuda')
-            sh_rest=torch.tensor(sh_rest,dtype=torch.float32,device='cuda')
-            opacity=torch.tensor(opacity,dtype=torch.float32,device='cuda')
-            if loaded_features is not None:
-                features = torch.tensor(loaded_features, dtype=torch.float32, device='cuda')
-            else:
-                features = None
-            
-            # Pad sh_rest if inferred degree is less than target degree
-            if inferred_sh_degree < lp.sh_degree:
-                print(f"Padding SH coefficients from degree {inferred_sh_degree} to {lp.sh_degree}")
-                num_points = sh_rest.shape[2]
-                target_sh_count = (lp.sh_degree + 1) ** 2 - 1
-                current_sh_count = sh_rest.shape[0]
-                if target_sh_count > current_sh_count:
-                    extra_sh = torch.zeros((target_sh_count - current_sh_count, 3, num_points), device='cuda')
-                    sh_rest = torch.cat([sh_rest, extra_sh], dim=0)
+        if pp.load_ff_gaussian:
+            ply_path = os.path.join(lp.source_path, "0000.ply")
+            if os.path.exists(ply_path):
+                print(f"Loading initial Gaussians from {ply_path}")
+                xyz,scale,rot,sh_0,sh_rest,opacity,inferred_sh_degree,loaded_features=io_manager.load_ply(ply_path,lp.sh_degree)
+                init_points_num=xyz.shape[-1]
+                xyz=torch.tensor(xyz,dtype=torch.float32,device='cuda')
+                scale=torch.tensor(scale,dtype=torch.float32,device='cuda')
+                rot=torch.tensor(rot,dtype=torch.float32,device='cuda')
+                sh_0=torch.tensor(sh_0,dtype=torch.float32,device='cuda')
+                sh_rest=torch.tensor(sh_rest,dtype=torch.float32,device='cuda')
+                opacity=torch.tensor(opacity,dtype=torch.float32,device='cuda')
+                if pp.load_features and loaded_features is not None:
+                    features = torch.tensor(loaded_features, dtype=torch.float32, device='cuda')
+                else:
+                    features = None
+                
+                # Pad sh_rest if inferred degree is less than target degree
+                if inferred_sh_degree < lp.sh_degree:
+                    print(f"Padding SH coefficients from degree {inferred_sh_degree} to {lp.sh_degree}")
+                    num_points = sh_rest.shape[2]
+                    target_sh_count = (lp.sh_degree + 1) ** 2 - 1
+                    current_sh_count = sh_rest.shape[0]
+                    if target_sh_count > current_sh_count:
+                        extra_sh = torch.zeros((target_sh_count - current_sh_count, 3, num_points), device='cuda')
+                        sh_rest = torch.cat([sh_rest, extra_sh], dim=0)
         else:
             init_xyz=torch.tensor(init_xyz,dtype=torch.float32,device='cuda')
             init_color=torch.tensor(init_color,dtype=torch.float32,device='cuda')
@@ -149,8 +162,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             if features is None:
                 features = torch.zeros((lp.feature_dim, xyz.shape[-1]), device='cuda')
             
-            classifier = torch.nn.Conv2d(lp.feature_dim, lp.num_classes, kernel_size=1).cuda()
-            cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+            if pp.use_classifier:
+                classifier = torch.nn.Conv2d(lp.feature_dim, lp.num_classes, kernel_size=1).cuda()
+                cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
+            else:
+                classifier = None
+                cls_optimizer = None
 
         if pp.cluster_size:
             if features is not None:
@@ -171,7 +188,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         start_epoch=0
     else:
         xyz,scale,rot,sh_0,sh_rest,opacity,features,start_epoch,opt,schedular,classifier_state,cls_opt_state=io_manager.load_checkpoint(start_checkpoint)
-        if lp.feature_dim > 0:
+        if lp.feature_dim > 0 and pp.use_classifier:
             classifier = torch.nn.Conv2d(lp.feature_dim, lp.num_classes, kernel_size=1).cuda()
             if classifier_state is not None:
                 classifier.load_state_dict(classifier_state)
@@ -205,7 +222,8 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     density_controller=densify.DensityControllerTamingGS(norm_radius,dp,pp.cluster_size>0,init_points_num)
     StatisticsHelperInst.reset(xyz.shape[-2],xyz.shape[-1],density_controller.is_densify_actived)
     
-    writer = SummaryWriter(log_dir=lp.model_path)
+    log_dir = os.path.join(lp.model_path, datetime.now().strftime('%Y%m%d-%H%M%S'))
+    writer = SummaryWriter(log_dir=log_dir)
     
     progress_bar = tqdm(range(start_epoch, total_epoch), desc="Training progress")
     progress_bar.update(0)
@@ -229,19 +247,16 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 frustumplane=frustumplane.cuda()
                 gt_image=gt_image.cuda()/255.0
                 idx=idx.cuda()
-                if gt_mask is not None:
-                    if isinstance(gt_mask, (list, tuple)):
-                        if gt_mask[0] is not None:
-                            gt_mask = gt_mask.cuda().long()
-                    else:
-                        gt_mask = gt_mask.cuda().long()
                 
+                if isinstance(gt_mask, (list, tuple)):
+                    gt_mask = gt_mask[0]
+                if gt_mask is not None:
+                    gt_mask = gt_mask.cuda().long()
+                
+                if isinstance(gt_depth, (list, tuple)):
+                    gt_depth = gt_depth[0]
                 if gt_depth is not None:
-                    if isinstance(gt_depth, (list, tuple)):
-                        if gt_depth[0] is not None:
-                            gt_depth = gt_depth.cuda()
-                    else:
-                        gt_depth = gt_depth.cuda()
+                    gt_depth = gt_depth.cuda()
                         
                 if op.learnable_viewproj:
                     #fix view matrix
@@ -268,7 +283,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loss+=(1-transmitance).abs().mean()
                 
                 depth_loss = 0
-                if op.lambda_depth > 0 and depth is not None and gt_depth is not None:
+                if op.lambda_depth > 0 and depth is not None and isinstance(gt_depth, torch.Tensor):
                     # Use the smaller resolution between rendered depth and gt_depth
                     h_render, w_render = depth.shape[2:]
                     h_gt, w_gt = gt_depth.shape[2:]
@@ -289,9 +304,12 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loss += op.lambda_depth * depth_loss
 
                 class_loss = 0
-                if do_classification and class_feature is not None and gt_mask is not None:
+                if do_classification and class_feature is not None and isinstance(gt_mask, torch.Tensor):
                     # Use classifier to get logits
-                    logits = classifier(class_feature)
+                    if pp.use_classifier:
+                        logits = classifier(class_feature)
+                    else:
+                        logits = class_feature
                     
                     # Use the smaller resolution between logits and gt_mask
                     h_logits, w_logits = logits.shape[2:]
@@ -306,8 +324,17 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     if gt_mask.shape[2:] != target_size:
                         curr_gt_mask = torch.nn.functional.interpolate(gt_mask.float(), size=target_size, mode='nearest').long()
                         
-                    # gt_mask is [B, 1, H, W], logits is [B, num_classes, H, W]
-                    class_loss = torch.nn.functional.cross_entropy(curr_logits, curr_gt_mask.squeeze(1).long())
+                    # Target index must be in [0, num_classes - 1]
+                    target = curr_gt_mask.squeeze(1).long()
+                    num_classes = curr_logits.shape[1]
+                    
+                    # Manual masking to bypass index assertion in some PyTorch versions
+                    mask_valid = (target >= 0) & (target < num_classes)
+                    safe_target = torch.where(mask_valid, target, torch.zeros_like(target))
+                    
+                    # Compute per-pixel loss then average manually
+                    pixel_loss = torch.nn.functional.cross_entropy(curr_logits, safe_target, reduction='none')
+                    class_loss = (pixel_loss * mask_valid.float()).sum() / (mask_valid.sum() + 1e-7)
                     loss += class_loss
  
                 loss.backward()
@@ -368,20 +395,20 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         gt_image = gt_image.cuda() / 255.0
                         idx = idx.cuda()
 
+                        if isinstance(gt_mask, (list, tuple)):
+                            gt_mask = gt_mask[0]
+                        
                         if gt_mask is not None:
-                            if isinstance(gt_mask, (list, tuple)):
-                                gt_mask = gt_mask[0]
-                            if gt_mask is not None:
-                                gt_mask = gt_mask.cuda().long()
+                            gt_mask = gt_mask.cuda().long()
                         else:
                             # Handle missing gt_mask by creating a default mask
                             gt_mask = torch.ones_like(gt_image[:, 0:1, :, :], device='cuda')
                         
+                        if isinstance(gt_depth, (list, tuple)):
+                            gt_depth = gt_depth[0]
+                        
                         if gt_depth is not None:
-                            if isinstance(gt_depth, (list, tuple)):
-                                gt_depth = gt_depth[0]
-                            if gt_depth is not None:
-                                gt_depth = gt_depth.cuda()
+                            gt_depth = gt_depth.cuda()
 
                         if op.learnable_viewproj:
                             if name == "Trainingset":
@@ -412,6 +439,29 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             writer.add_image(f'test/{name}_render', img[0], epoch)
                             writer.add_image(f'test/{name}_gt', gt_image[0], epoch)
 
+                        if feature_map is not None:
+                            if classifier is not None:
+                                logits = classifier(feature_map)
+                            else:
+                                logits = feature_map
+                            pred_mask = torch.argmax(logits, dim=1)
+                            if i == 0:
+                                mask_to_log = pred_mask.float() / (lp.num_classes - 1) if lp.num_classes > 1 else pred_mask.float()
+                                writer.add_image(f'test/{name}_pred_mask', mask_to_log, epoch)
+                            
+                            # save to disk
+                            mask_save_dir = os.path.join(lp.model_path, "test_masks", f"epoch_{epoch}", name)
+                            os.makedirs(mask_save_dir, exist_ok=True)
+                            
+                            img_name = loader.dataset.frames[idx.item()].name
+                            base_name = os.path.splitext(img_name)[0]
+                            
+                            mask_np = pred_mask[0].detach().cpu().numpy().astype(np.uint8)
+                            # Standard single-channel mask
+                            Image.fromarray(mask_np).save(os.path.join(mask_save_dir, f"{base_name}.png"))
+                            # Colored visualization
+                            plt.imsave(os.path.join(mask_save_dir, f"{base_name}_vis.png"), mask_np, vmin=0, vmax=lp.num_classes-1)
+
                         psnr_list.append(psnr_metrics(img, gt_image).unsqueeze(0))
                     
                     avg_psnr = torch.concat(psnr_list, dim=0).mean()
@@ -420,7 +470,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         f"\n[EPOCH {epoch}] {name} Evaluating: PSNR {avg_psnr}"
                     )
 
-        params=density_controller.step(opt,epoch)
+        params=density_controller.step(opt,epoch,dp.large_limit)
         xyz,scale,rot,sh_0,sh_rest,opacity=params["xyz"],params["scale"],params["rot"],params["sh_0"],params["sh_rest"],params["opacity"]
         if "features" in params:
             features = params["features"]
@@ -450,17 +500,22 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             io_manager.save_ply(os.path.join(save_path,"point_cloud.ply"),*param_nyp)
 
             # Save separate PLY files for each category if features exist
-            if features is not None and classifier is not None:
+            if features is not None:
                 # features is the last element in tensors
                 feat_tensor = tensors[-1]
                 # feat_tensor is [C, N]
-                classifier.eval()
-                with torch.no_grad():
-                    # Use classifier to get categories for each point
-                    # Conv2d expects [B, C, H, W], so we use [1, C, N, 1]
-                    logits = classifier(feat_tensor.unsqueeze(0).unsqueeze(-1)).squeeze(0).squeeze(-1)
-                    categories = torch.argmax(logits, dim=0)
-                classifier.train()
+                
+                if pp.use_classifier and classifier is not None:
+                    classifier.eval()
+                    with torch.no_grad():
+                        # Use classifier to get categories for each point
+                        # Conv2d expects [B, C, H, W], so we use [1, C, N, 1]
+                        logits = classifier(feat_tensor.unsqueeze(0).unsqueeze(-1)).squeeze(0).squeeze(-1)
+                        categories = torch.argmax(logits, dim=0)
+                    classifier.train()
+                else:
+                    # features directly represent category logits/one-hots
+                    categories = torch.argmax(feat_tensor, dim=0)
                 
                 unique_cats = torch.unique(categories)
                 print(f"Saving {len(unique_cats)} categories to separate PLY files...")

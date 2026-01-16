@@ -165,6 +165,33 @@ def remove_outliers_radius(xyz, radius=0.1, min_neighbors=5):
     
     return mask
 
+def remove_outliers_spatial(xyz, factor=0.2):
+    """
+    基于空间范围剔除远离中心的点
+    
+    参数:
+        xyz: 点云坐标 (N, 3)
+        factor: 保留范围比例，0.2 表示只保留中心向外占总长度 20% 的区域
+    """
+    print(f"\n执行空间方位过滤 (保留中心 {factor*100:.0f}% 区域)...")
+    
+    # 使用原始的最值边界，不使用分位数
+    q_min = np.min(xyz, axis=0)
+    q_max = np.max(xyz, axis=0)
+    
+    # 以坐标原点为中心
+    center = np.zeros(3)
+    # half_size = (总长度 / 2) * factor
+    half_size = (q_max - q_min) / 2 * factor
+    
+    mask = np.all((xyz >= center - half_size) & (xyz <= center + half_size), axis=1)
+    
+    num_outliers = np.sum(~mask)
+    if len(xyz) > 0:
+        print(f"空间过滤移除 {num_outliers} 个范围外点 ({num_outliers/len(xyz)*100:.2f}%)")
+    
+    return mask
+
 def main():
     parser = argparse.ArgumentParser(description='去除.ply文件中的离群点')
     parser.add_argument('input', type=str, help='输入.ply文件路径')
@@ -192,6 +219,10 @@ def main():
     parser.add_argument('--min_neighbors', type=int, default=5, 
                         help='半径方法: 最小邻居数 (默认: 5)')
     
+    # 空间范围参数
+    parser.add_argument('--spatial_filter', action='store_true',
+                        help='是否启用空间范围过滤 (移除远离中心 20%% 的点)')
+    
     args = parser.parse_args()
     
     # 检查输入文件
@@ -207,22 +238,41 @@ def main():
     # 加载.ply文件
     plydata, properties, xyz = load_ply(args.input)
     
-    # 根据选择的方法去除离群点
+    # 1. 优先执行空间范围过滤（可选）
+    final_mask = np.ones(len(xyz), dtype=bool)
+    if args.spatial_filter:
+        # 只保留中心 20% 的区域
+        final_mask &= remove_outliers_spatial(xyz, factor=0.5)
+        # 更新用于后续统计的 xyz（仅计算保留的点）
+        xyz_effective = xyz[final_mask]
+    else:
+        xyz_effective = xyz
+    
+    # 2. 根据选择的方法去除离群点
     if args.method == 'statistical':
-        mask = remove_outliers_statistical(xyz, k=args.k, std_ratio=args.std_ratio)
+        sub_mask = remove_outliers_statistical(xyz_effective, k=args.k, std_ratio=args.std_ratio)
     elif args.method == 'dbscan':
-        mask = remove_outliers_dbscan(xyz, eps=args.eps, min_samples=args.min_samples)
+        sub_mask = remove_outliers_dbscan(xyz_effective, eps=args.eps, min_samples=args.min_samples)
     elif args.method == 'radius':
-        mask = remove_outliers_radius(xyz, radius=args.radius, min_neighbors=args.min_neighbors)
+        sub_mask = remove_outliers_radius(xyz_effective, radius=args.radius, min_neighbors=args.min_neighbors)
+    
+    # 合并 mask
+    if args.spatial_filter:
+        # 将子遮罩映射回原始索引
+        full_sub_mask = np.zeros(len(xyz), dtype=bool)
+        full_sub_mask[final_mask] = sub_mask
+        final_mask = full_sub_mask
+    else:
+        final_mask = sub_mask
     
     # 保存过滤后的.ply文件
-    save_ply(args.output, plydata, properties, mask)
+    save_ply(args.output, plydata, properties, final_mask)
     
     print(f"\n完成！")
     print(f"原始点数: {len(xyz)}")
-    print(f"保留点数: {np.sum(mask)}")
-    print(f"移除点数: {np.sum(~mask)}")
-    print(f"移除比例: {np.sum(~mask)/len(xyz)*100:.2f}%")
+    print(f"保留点数: {np.sum(final_mask)}")
+    print(f"移除点数: {np.sum(~final_mask)}")
+    print(f"移除比例: {np.sum(~final_mask)/len(xyz)*100:.2f}%")
 
 if __name__ == '__main__':
     main()

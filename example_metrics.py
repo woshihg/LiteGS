@@ -11,7 +11,22 @@ import litegs
 import litegs.config
 import litegs.utils
 import shutil
+import numpy as np
 
+def custom_collate_fn(batch):
+    filtered_batch = [item for item in batch if item is not None]
+    if len(filtered_batch) == 0:
+        return None
+    collated = []
+    for i in range(len(filtered_batch[0])):
+        field = [item[i] for item in filtered_batch]
+        if isinstance(field[0], (torch.Tensor, np.ndarray)):
+            if isinstance(field[0], np.ndarray):
+                field = [torch.from_numpy(f) for f in field]
+            collated.append(torch.stack(field))
+        else:
+            collated.append(field)
+    return tuple(collated)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
@@ -62,12 +77,12 @@ if __name__ == "__main__":
             training_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 != 0]
             test_frames=[c for idx, c in enumerate(camera_frames) if idx % 8 == 0]
         trainingset=litegs.data.CameraFrameDataset(cameras_info,training_frames,lp.resolution,pp.device_preload)
-        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=lambda x: x[0])
+        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=custom_collate_fn)
         testset=litegs.data.CameraFrameDataset(cameras_info,test_frames,lp.resolution,pp.device_preload)
-        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=lambda x: x[0])
+        test_loader = DataLoader(testset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=custom_collate_fn)
     else:
         trainingset=litegs.data.CameraFrameDataset(cameras_info,camera_frames,lp.resolution,pp.device_preload)
-        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=lambda x: x[0])
+        train_loader = DataLoader(trainingset, batch_size=1,shuffle=False,pin_memory=not pp.device_preload, collate_fn=custom_collate_fn)
     norm_trans,norm_radius=trainingset.get_norm()
 
     #model

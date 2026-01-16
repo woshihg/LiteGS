@@ -28,7 +28,8 @@ scene_primitive = {
     "truck": 340000*2,#136029
     "train": 360000*2,#182686
     "drjohnson": 800000*2,#80861
-    "playroom": 490000*2#37005
+    "playroom": 490000*2,#37005
+    "scene1": 500000*2
 }
 
 images={
@@ -50,17 +51,21 @@ images={
 parser = ArgumentParser(description="Full evaluation script parameters")
 parser.add_argument("--skip_training", action="store_true")
 parser.add_argument("--output_path", default="./output")
-parser.add_argument('--mipnerf360', "-m360", required=True, type=str)
-parser.add_argument("--tanksandtemples", "-tat", required=True, type=str)
-parser.add_argument("--deepblending", "-db", required=True, type=str)
+parser.add_argument('--mipnerf360', "-m360", default=None, type=str)
+parser.add_argument("--tanksandtemples", "-tat", default=None, type=str)
+parser.add_argument("--deepblending", "-db", default=None, type=str)
+parser.add_argument("--graspnet", "-gn", default=None, type=str)
 args, _ = parser.parse_known_args()
 
 
 datasets={
-    "mipnerf360_indoor":["bicycle", "flowers", "garden", "stump", "treehill"],
-    "mipnerf360_outdoor":["room", "counter", "kitchen", "bonsai"],
+    # "mipnerf360_indoor":["bicycle", "flowers", "garden", "stump", "treehill"],
+    # "mipnerf360_outdoor":["room", "counter", "kitchen", "bonsai"],
+    "mipnerf360_indoor":["bicycle"],
+    "mipnerf360_outdoor":[],
     "tanksandtemples":["truck", "train"],
     "deepblending":["drjohnson", "playroom"],
+    "graspnet":["scene1"]
 }
 
 img_folder={
@@ -68,9 +73,10 @@ img_folder={
     "mipnerf360_outdoor":"images_2",
     "tanksandtemples":"images",
     "deepblending":"images",
+    "graspnet":"images",
 }
-
-fast_config="--iterations 10000 --position_lr_max_steps 10000 --position_lr_final 0.000016 --densification_interval 2"
+#  --load_ff_gaussian
+fast_config="--iterations 10000 --position_lr_max_steps 10000 --position_lr_final 0.000016 --densification_interval 2 --load_ff_gaussian"
 
 training_args_tempalte="-s {0} -m {1} --eval --sh_degree 3 --target_primitives {2} -i {3} "+fast_config
 eval_args_template="-s {0} -m {1} --sh_degree 3 -i {2} --eval"
@@ -82,12 +88,17 @@ results={}
 
 if not args.skip_training:
     for dataset,scenes in datasets.items():
+        dataset_path = args.__getattribute__(dataset.split('_')[0])
+        if dataset_path is None:
+            continue
         for scene_name in scenes:
-            scene_input_path=os.path.join(args.__getattribute__(dataset.split('_')[0]),scene_name)
+            scene_input_path=os.path.join(dataset_path,scene_name)
+            if not os.path.exists(scene_input_path):
+                continue
             target_primitives=scene_primitive[scene_name]
             scene_output_path=os.path.join(args.output_path,scene_name+'-{}k-fast'.format(int(target_primitives/1000)))
             training_args=training_args_tempalte.format(scene_input_path,scene_output_path,target_primitives,img_folder[dataset])
-            results[scene_name]={target_primitives:{}}
+            results[scene_name]={target_primitives:{"takes":0, "SSIM_train":0, "PSNR_train":0, "LPIPS_train":0, "SSIM_test":0, "PSNR_test":0, "LPIPS_test":0}}
             print("scene:{} #primitive:{}".format(scene_name,target_primitives))
 
             process = subprocess.Popen(["python","example_train.py"]+training_args.split(' '), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -99,9 +110,17 @@ if not args.skip_training:
                 results[scene_name][target_primitives]["takes"]=float(match.group(1))
 
 for dataset,scenes in datasets.items():
+    dataset_path = args.__getattribute__(dataset.split('_')[0])
+    if dataset_path is None:
+        continue
     for scene_name in scenes:
-        scene_input_path=os.path.join(args.__getattribute__(dataset.split('_')[0]),scene_name)
+        scene_input_path=os.path.join(dataset_path,scene_name)
+        if not os.path.exists(scene_input_path):
+            continue
         target_primitives=scene_primitive[scene_name]
+        if scene_name not in results:
+            results[scene_name]={target_primitives:{"takes":0, "SSIM_train":0, "PSNR_train":0, "LPIPS_train":0, "SSIM_test":0, "PSNR_test":0, "LPIPS_test":0}}
+        
         scene_output_path=os.path.join(args.output_path,scene_name+'-{}k-fast'.format(int(target_primitives/1000)))
         eval_args=eval_args_template.format(scene_input_path,scene_output_path,img_folder[dataset])
         process = subprocess.Popen(["python","example_metrics.py"]+eval_args.split(' '), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
