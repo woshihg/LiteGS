@@ -56,7 +56,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
             if res is not None:
                 depth_count += 1
 
-        if lp.feature_dim > 0:
+        if op.loss_mask:
             mask_path = os.path.join(lp.source_path, "masks", camera_frame.name)
             if not os.path.exists(mask_path):
                 base_name = os.path.splitext(camera_frame.name)[0]
@@ -72,7 +72,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
     
     if op.lambda_depth > 0:
         print(f"[ INFO ] Depth supervision found for {depth_count}/{len(camera_frames)} images")
-    if lp.feature_dim > 0:
+    if op.loss_mask:
         print(f"[ INFO ] Mask supervision found for {mask_count}/{len(camera_frames)} images")
 
     #Dataset
@@ -135,8 +135,16 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                 sh_0=torch.tensor(sh_0,dtype=torch.float32,device='cuda')
                 sh_rest=torch.tensor(sh_rest,dtype=torch.float32,device='cuda')
                 opacity=torch.tensor(opacity,dtype=torch.float32,device='cuda')
+                
+                if pp.reset_load_opacity:
+                    print("[ INFO ] Resetting initial opacity to low value (0.01)")
+                    opacity.fill_(math.log(0.01 / (1 - 0.01)))
+
                 if pp.load_features and loaded_features is not None:
                     features = torch.tensor(loaded_features, dtype=torch.float32, device='cuda')
+                    if lp.feature_dim == 0:
+                        lp.feature_dim = features.shape[0]
+                        print(f"Setting feature_dim to {lp.feature_dim} from loaded PLY")
                 else:
                     features = None
                 
@@ -188,6 +196,10 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
         start_epoch=0
     else:
         xyz,scale,rot,sh_0,sh_rest,opacity,features,start_epoch,opt,schedular,classifier_state,cls_opt_state=io_manager.load_checkpoint(start_checkpoint)
+        if features is not None and lp.feature_dim == 0:
+            lp.feature_dim = features.shape[0]
+            print(f"Setting feature_dim to {lp.feature_dim} from checkpoint")
+            
         if lp.feature_dim > 0 and pp.use_classifier:
             classifier = torch.nn.Conv2d(lp.feature_dim, lp.num_classes, kernel_size=1).cuda()
             if classifier_state is not None:
@@ -269,14 +281,21 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     cluster_origin,cluster_extend,frustumplane,view_matrix,xyz,scale,rot,sh_0,sh_rest,opacity,op,pp,actived_sh_degree,features)
                 
                 # Conditionally render classification features
-                do_classification = (culled_features is not None) and (global_step % op.classification_iter == 0)
+                do_classification = (culled_features is not None) and (global_step % op.classification_iter == 0) and op.loss_mask
                 render_features = culled_features if do_classification else None
 
                 img,transmitance,depth,normal,primitive_visible,class_feature=render.render(view_matrix,proj_matrix,culled_xyz,culled_scale,culled_rot,culled_color,culled_opacity,
                                                             actived_sh_degree,gt_image.shape[2:],pp,render_features)
                 
+                # # Debug save
+                # debug_dir = "/home/woshihg/PycharmProjects/LiteGS/debug"
+                # os.makedirs(debug_dir, exist_ok=True)
+                # img_to_save = (img[0].detach().cpu().permute(1, 2, 0).numpy().clip(0, 1) * 255).astype(np.uint8)
+                # Image.fromarray(img_to_save).save(os.path.join(debug_dir, "current_render.png"))
+
                 l1_loss=__l1_loss(img,gt_image)
                 ssim_loss:torch.Tensor=1-fused_ssim.fused_ssim(img,gt_image)
+                # print("l1_loss:",l1_loss.item(),"ssim_loss:",ssim_loss.item())
                 loss=(1.0-op.lambda_dssim)*l1_loss+op.lambda_dssim*ssim_loss
                 loss+=(culled_scale).mean()*op.reg_weight
                 if pp.enable_transmitance:
@@ -388,6 +407,11 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     loaders["Testset"] = test_loader
                 for name, loader in loaders.items():
                     psnr_list = []
+                    # Intersection and union for mIoU
+                    total_intersection = torch.zeros(lp.num_classes, device='cuda')
+                    total_union = torch.zeros(lp.num_classes, device='cuda')
+                    has_gt_mask = False
+
                     for i, (view_matrix, proj_matrix, frustumplane, gt_image, idx, gt_mask, gt_depth) in enumerate(loader):
                         view_matrix = view_matrix.cuda()
                         proj_matrix = proj_matrix.cuda()
@@ -400,6 +424,7 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                         
                         if gt_mask is not None:
                             gt_mask = gt_mask.cuda().long()
+                            has_gt_mask = True
                         else:
                             # Handle missing gt_mask by creating a default mask
                             gt_mask = torch.ones_like(gt_image[:, 0:1, :, :], device='cuda')
@@ -445,6 +470,21 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                             else:
                                 logits = feature_map
                             pred_mask = torch.argmax(logits, dim=1)
+
+                            if has_gt_mask:
+                                # Resize logits to gt_mask size for accurate mIoU
+                                h_gt, w_gt = gt_mask.shape[2:]
+                                if logits.shape[2:] != (h_gt, w_gt):
+                                    logits_resized = torch.nn.functional.interpolate(logits, size=(h_gt, w_gt), mode='bilinear', align_corners=False)
+                                else:
+                                    logits_resized = logits
+                                pred_mask_resized = torch.argmax(logits_resized, dim=1)
+                                target_mask = gt_mask.squeeze(1)
+                                
+                                for cls in range(lp.num_classes):
+                                    total_intersection[cls] += ((pred_mask_resized == cls) & (target_mask == cls)).sum()
+                                    total_union[cls] += ((pred_mask_resized == cls) | (target_mask == cls)).sum()
+
                             if i == 0:
                                 mask_to_log = pred_mask.float() / (lp.num_classes - 1) if lp.num_classes > 1 else pred_mask.float()
                                 writer.add_image(f'test/{name}_pred_mask', mask_to_log, epoch)
@@ -466,9 +506,42 @@ def start(lp:arguments.ModelParams,op:arguments.OptimizationParams,pp:arguments.
                     
                     avg_psnr = torch.concat(psnr_list, dim=0).mean()
                     writer.add_scalar(f'test/{name}_psnr', avg_psnr, epoch)
+                    
+                    miou = 0
+                    if has_gt_mask:
+                        ious = total_intersection / (total_union + 1e-7)
+                        # Only average classes that exist in the GT or Prediction
+                        valid_classes = total_union > 0
+                        if valid_classes.any():
+                            miou = ious[valid_classes].mean().item()
+                            writer.add_scalar(f'test/{name}_miou', miou, epoch)
+
                     tqdm.write(
-                        f"\n[EPOCH {epoch}] {name} Evaluating: PSNR {avg_psnr}"
+                        f"\n[EPOCH {epoch}] {name} Evaluating: PSNR {avg_psnr:.4f}" + (f" mIoU {miou:.4f}" if has_gt_mask else "")
                     )
+
+        if epoch == start_epoch and pp.reset_load_opacity:
+            print(f"[ INFO ] Filtering low-opacity Gaussians after first epoch (threshold: {dp.opacity_threshold * 10})")
+            with torch.no_grad():
+                temp_opacity = opacity
+                if pp.cluster_size:
+                    temp_opacity, = scene.cluster.uncluster(opacity)
+                
+                mask = (temp_opacity.sigmoid() > (dp.opacity_threshold * 10)).squeeze()
+                num_before = mask.numel()
+                num_after = mask.sum().item()
+                print(f"[ INFO ] Removed {num_before - num_after} points ({(num_before - num_after) / num_before * 100:.2f}%)")
+                
+                density_controller._prune_optimizer(mask, opt)
+                
+                # Refresh local references
+                new_params = density_controller._get_params_from_optimizer(opt)
+                xyz, scale, rot, sh_0, sh_rest, opacity = new_params["xyz"], new_params["scale"], new_params["rot"], new_params["sh_0"], new_params["sh_rest"], new_params["opacity"]
+                if "features" in new_params:
+                    features = new_params["features"]
+
+                # Reset statistics helper since points number changed
+                StatisticsHelperInst.reset(xyz.shape[-2], xyz.shape[-1], density_controller.is_densify_actived)
 
         params=density_controller.step(opt,epoch,dp.large_limit)
         xyz,scale,rot,sh_0,sh_rest,opacity=params["xyz"],params["scale"],params["rot"],params["sh_0"],params["sh_rest"],params["opacity"]

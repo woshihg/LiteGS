@@ -33,6 +33,7 @@ class CameraInfo:
 class PinHoleCameraInfo(CameraInfo):
     def __init__(self,id:int,width:int,height:int,parameters:list[float],z_near=0.01,z_far=5000.0):
         super(PinHoleCameraInfo,self).__init__(id,"PINHOLE",width,height)
+        self.params = parameters
         focal_length_x=parameters[0]
         focal_length_y=parameters[1]
         recp_tan_half_fov_x=focal_length_x/(width*0.5)

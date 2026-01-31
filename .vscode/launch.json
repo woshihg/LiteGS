@@ -9,7 +9,14 @@
             "type": "debugpy",
             "request": "launch",
             "program": "./example_train.py",
-            "args":["--sh_degree","3","-s","dataset/mipnerf360/garden","-m","output/garden","--images","images_4","--target_primitives","1000000","--iterations","10000","--position_lr_max_steps","10000","--position_lr_final","0.000016","--densification_interval","2","--eval"],
+            "python": "/home/woshihg/miniconda3/envs/litegs/bin/python",
+            // "args":["--sh_degree","3","-s","/home/woshihg/PycharmProjects/LiteGS/data-test/mydata_obj","-m","/home/woshihg/PycharmProjects/LiteGS/output","--images","images_4","--target_primitives","1000000","--iterations","10000","--position_lr_max_steps","10000","--position_lr_final","0.000016","--densification_interval","2","--eval"],
+            "args":["-s", "/home/woshihg/mydata_obj/scene2",
+            "-m", "/home/woshihg/PycharmProjects/LiteGS/output/mydata_obj/scene2",
+            // "--load_ff_gaussian",
+            // "--resolution", "4",
+            // "--feature_dim", "16"
+            ],
             "cwd":"${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": false,
@@ -29,7 +36,7 @@
             "type": "debugpy",
             "request": "launch",
             "program": "./scripts/full_eval_fast.py",
-            "args":["-m360","dataset/mipnerf360","-tat","dataset/tandt","-db","dataset/db"],
+            "args":["-m360","/home/woshihg/360_v2"],
             "cwd":"${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": false,
@@ -42,6 +49,23 @@
             "cwd":"${workspaceFolder}",
             "justMyCode": false,
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: Optimize Texture (Mesh)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "create_mesh/main.py",
+            "python": "/home/woshihg/miniconda3/envs/litegs/bin/python",
+            "args": [
+                "--mesh", "/home/woshihg/PycharmProjects/LiteGS/data-test/mydata_obj/mesh.ply",
+                "--colmap", "/home/woshihg/PycharmProjects/LiteGS/data-test/mydata_obj",
+                "--images", "images",
+                "--iters", "10000",
+                "--res", "1024"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
     

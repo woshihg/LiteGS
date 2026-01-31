@@ -86,7 +86,7 @@ if __name__ == "__main__":
     norm_trans,norm_radius=trainingset.get_norm()
 
     #model
-    xyz,scale,rot,sh_0,sh_rest,opacity,inferred_sh_degree,features=litegs.io_manager.load_ply(os.path.join(lp.model_path,"point_cloud","finish","point_cloud.ply"),lp.sh_degree)
+    xyz,scale,rot,sh_0,sh_rest,opacity,inferred_sh_degree,features=litegs.io_manager.load_ply(os.path.join(lp.model_path,"point_cloud","finish","point_cloud.ply"),lp.sh_degree, pp.reset_load_opacity)
     xyz=torch.Tensor(xyz).cuda()
     scale=torch.Tensor(scale).cuda()
     rot=torch.Tensor(rot).cuda()

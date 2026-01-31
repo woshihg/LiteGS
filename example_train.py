@@ -13,8 +13,8 @@ if __name__ == "__main__":
     litegs.arguments.DensifyParams.add_cmdline_arg(dp_cdo,parser)
     
     parser.add_argument("--test_epochs", nargs="+", type=int, default=[i for i in range(0,300,10)])
-    parser.add_argument("--save_epochs", nargs="+", type=int, default=[10, 20, 110, 210, 300, 400, 500, 600, 700, 800, 900, 1000])
-    # parser.add_argument("--save_epochs", nargs="+", type=int, default=[500, 1000])
+    # parser.add_argument("--save_epochs", nargs="+", type=int, default=[10, 20, 110, 210, 300, 400, 500, 600, 700, 800, 900, 1000])
+    parser.add_argument("--save_epochs", nargs="+", type=int, default=[10, 20])
     parser.add_argument("--checkpoint_epochs", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
